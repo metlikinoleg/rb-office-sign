@@ -10,9 +10,17 @@ DSS_LOGIN = os.getenv("DSS_LOGIN")
 DSS_PASSWORD = os.getenv("DSS_PASSWORD")
 DSS_PIN = os.getenv("DSS_PIN", "")
 
-# OAuth клиент тестового СЭП
-OAUTH_CLIENT_ID = "testClient"
+OAUTH_CLIENT_ID = os.getenv("DSS_CLIENT_ID", "")
 OAUTH_RESOURCE = "urn:cryptopro:dss:signserver:signserver"
+
+
+def check_config():
+    missing = []
+    if not DSS_LOGIN: missing.append("DSS_LOGIN")
+    if not DSS_PASSWORD: missing.append("DSS_PASSWORD")
+    if not OAUTH_CLIENT_ID: missing.append("DSS_CLIENT_ID")
+    if missing:
+        raise ValueError(f"Отсутствуют переменные: {', '.join(missing)}")
 
 
 async def get_access_token() -> str:
