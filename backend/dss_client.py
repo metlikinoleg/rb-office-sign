@@ -11,7 +11,7 @@ DSS_PASSWORD = os.getenv("DSS_PASSWORD")
 DSS_PIN = os.getenv("DSS_PIN", "")
 
 # OAuth клиент тестового СЭП
-OAUTH_CLIENT_ID = "oauth-client-id"
+OAUTH_CLIENT_ID = "testClient"
 OAUTH_RESOURCE = "urn:cryptopro:dss:signserver:signserver"
 
 
