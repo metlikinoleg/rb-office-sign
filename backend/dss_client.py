@@ -20,7 +20,7 @@ def check_config():
     if not DSS_PASSWORD: missing.append("DSS_PASSWORD")
     if not OAUTH_CLIENT_ID: missing.append("DSS_CLIENT_ID")
     if missing:
-        raise ValueError(f"Отсутствуют переменные: {', '.join(missing)}")
+        raise ValueError(f"Отсутствуют переменные окружения: {', '.join(missing)}")
 
 
 async def get_access_token() -> str:
@@ -28,6 +28,7 @@ async def get_access_token() -> str:
     Получает OAuth access_token от Центра Идентификации DSS.
     Использует grant_type=password (Resource Owner Password Credentials).
     """
+    check_config()
     url = f"{DSS_BASE_URL}/STS/oauth/token"
 
     # client_id передаётся в Basic Auth заголовке: Base64(client_id:)
