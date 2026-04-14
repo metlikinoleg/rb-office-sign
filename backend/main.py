@@ -12,6 +12,9 @@ app = FastAPI(title="RB-Office Sign API")
 
 JWT_SECRET = os.getenv("JWT_SECRET")
 ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL")
+SIGNATURES_DIR = os.getenv("SIGNATURES_DIR", "./signatures")
+
+os.makedirs(SIGNATURES_DIR, exist_ok=True)
 
 
 @app.get("/health")
@@ -104,8 +107,8 @@ async def onlyoffice_callback(request: Request):
         # Подписываем
         sig_bytes = await sign_document(file_content, f"{key}.docx")
 
-        # Сохраняем подпись рядом с документом
-        sig_path = f"/tmp/{key}.sig"
+        # Сохраняем подпись в постоянную директорию
+        sig_path = os.path.join(SIGNATURES_DIR, f"{key}.sig")
         with open(sig_path, "wb") as f:
             f.write(sig_bytes)
 
@@ -118,6 +121,21 @@ async def onlyoffice_callback(request: Request):
 
     # Остальные статусы — просто подтверждаем
     return {"error": 0}
+
+
+@app.get("/dss/signatures/{key}")
+async def get_signature(key: str):
+    """Отдаёт .sig файл по ключу документа."""
+    sig_path = os.path.join(SIGNATURES_DIR, f"{key}.sig")
+    if not os.path.isfile(sig_path):
+        raise HTTPException(status_code=404, detail="Подпись не найдена")
+    with open(sig_path, "rb") as f:
+        sig_bytes = f.read()
+    return Response(
+        content=sig_bytes,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{key}.sig"'},
+    )
 
 
 @app.post("/dss/verify")
