@@ -135,3 +135,63 @@ async def sign_file(file_content: bytes) -> bytes:
     Обёртка для обратной совместимости с существующими endpoint-ами.
     """
     return await sign_document(file_content, "document")
+
+
+async def verify_signature(file_content: bytes, signature_content: bytes) -> dict:
+    """
+    Проверяет отделённую подпись CAdES-BES через КриптоПро SVS REST API.
+    Не требует OAuth-токена.
+
+    Возвращает dict с полями:
+      - valid: bool
+      - message: str
+      - signer: dict (SubjectName, IssuerName, NotBefore, NotAfter, Thumbprint)
+      - signature_type: str (BES, T, XLT1...)
+      - signing_time: str
+    """
+    source_b64 = base64.b64encode(file_content).decode()
+    sig_b64 = base64.b64encode(signature_content).decode()
+
+    payload = {
+        "SignatureType": "CAdES",
+        "Content": sig_b64,
+        "Source": source_b64,
+    }
+
+    url = f"{DSS_BASE_URL}/verify/rest/api/signatures"
+
+    async with httpx.AsyncClient(timeout=60, verify=True) as client:
+        response = await client.post(
+            url,
+            json=payload,
+            headers={"Content-Type": "application/json"},
+        )
+        if response.status_code != 200:
+            raise Exception(
+                f"Ошибка SVS: {response.status_code} {response.text}"
+            )
+
+        results = response.json()
+
+    # SVS возвращает массив результатов (по одному на каждого подписанта)
+    if not results or not isinstance(results, list):
+        raise Exception(f"Пустой или неожиданный ответ SVS: {results}")
+
+    first = results[0]
+    cert_info = first.get("SignerCertificateInfo", {})
+    sig_info = first.get("SignatureInfo", {})
+
+    return {
+        "valid": first.get("Result", False),
+        "message": first.get("Message") or "Подпись действительна",
+        "signer": {
+            "subject": cert_info.get("SubjectName"),
+            "issuer": cert_info.get("IssuerName"),
+            "valid_from": cert_info.get("NotBefore"),
+            "valid_to": cert_info.get("NotAfter"),
+            "thumbprint": cert_info.get("Thumbprint"),
+            "serial": cert_info.get("SerialNumber"),
+        },
+        "signature_type": sig_info.get("CAdESType"),
+        "signing_time": sig_info.get("LocalSigningTime"),
+    }

@@ -4,7 +4,7 @@ import httpx
 import os
 import base64
 from dotenv import load_dotenv
-from dss_client import sign_document, get_access_token, get_certificates
+from dss_client import sign_document, get_access_token, get_certificates, verify_signature
 
 load_dotenv()
 
@@ -118,3 +118,22 @@ async def onlyoffice_callback(request: Request):
 
     # Остальные статусы — просто подтверждаем
     return {"error": 0}
+
+
+@app.post("/dss/verify")
+async def verify_endpoint(
+    file: UploadFile = File(..., description="Исходный документ"),
+    signature: UploadFile = File(..., description="Файл подписи (.sig)"),
+):
+    """
+    Проверяет отделённую подпись.
+    Принимает два файла: оригинальный документ и .sig-файл.
+    Возвращает результат верификации с информацией о подписанте.
+    """
+    try:
+        file_content = await file.read()
+        sig_content = await signature.read()
+        result = await verify_signature(file_content, sig_content)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
