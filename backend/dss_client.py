@@ -11,6 +11,7 @@ DSS_PASSWORD = os.getenv("DSS_PASSWORD")
 DSS_PIN = os.getenv("DSS_PIN", "")
 
 OAUTH_CLIENT_ID = os.getenv("DSS_CLIENT_ID", "")
+DSS_CLIENT_SECRET = os.getenv("DSS_CLIENT_SECRET", "")
 OAUTH_RESOURCE = "urn:cryptopro:dss:signserver:signserver"
 
 
@@ -31,9 +32,10 @@ async def get_access_token() -> str:
     check_config()
     url = f"{DSS_BASE_URL}/STS/oauth/token"
 
-    # client_id передаётся в Basic Auth заголовке: Base64(client_id:)
+    # client_id:client_secret передаётся в Basic Auth заголовке
+    secret = DSS_CLIENT_SECRET if DSS_CLIENT_SECRET else ""
     client_credentials = base64.b64encode(
-        f"{OAUTH_CLIENT_ID}:".encode()
+        f"{OAUTH_CLIENT_ID}:{secret}".encode()
     ).decode()
 
     headers = {
