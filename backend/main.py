@@ -4,7 +4,7 @@ import httpx
 import os
 import base64
 from dotenv import load_dotenv
-from dss_client import sign_file, get_access_token, get_certificates
+from dss_client import sign_file, sign_document, get_access_token, get_certificates
 
 load_dotenv()
 
@@ -45,6 +45,22 @@ async def dss_check():
                 }
                 for c in certs
             ],
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/dss/sign-test")
+async def sign_test():
+    """Тестовое подписание — подписывает строку 'Hello DSS'."""
+    try:
+        test_content = b"Hello DSS - test signature"
+        sig_bytes = await sign_document(test_content, "test.txt")
+        sig_b64 = base64.b64encode(sig_bytes).decode()
+        return {
+            "status": "ok",
+            "signature_size": len(sig_bytes),
+            "signature_b64": sig_b64[:100] + "...",
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

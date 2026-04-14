@@ -60,7 +60,6 @@ async def get_access_token() -> str:
 async def get_certificates(access_token: str) -> list:
     """
     Получает список сертификатов пользователя.
-    Используется для получения cert_id.
     """
     url = f"{DSS_BASE_URL}/SignServer/rest/api/certificates"
 
@@ -75,25 +74,23 @@ async def get_certificates(access_token: str) -> list:
         return response.json()
 
 
-async def sign_document(
-    file_content: bytes,
-    access_token: str,
-    cert_id: int = 0,
-) -> bytes:
+async def get_default_certificate_id(access_token: str) -> int:
+    """Получает ID сертификата по умолчанию."""
+    certs = await get_certificates(access_token)
+    for cert in certs:
+        if cert.get("IsDefault") or cert.get("is_default"):
+            return cert.get("Id") or cert.get("id") or 0
+    return 0
+
+
+async def sign_document(file_content: bytes, file_name: str) -> bytes:
     """
-    Подписывает документ через REST API Сервиса Подписи DSS.
-    Возвращает отделённую подпись (CAdES-BES) в байтах.
-
-    cert_id=0 означает использование сертификата по умолчанию.
+    Подписывает документ через КриптоПро DSS REST API.
+    Возвращает байты отделённой подписи (.sig файл).
     """
-    url = f"{DSS_BASE_URL}/SignServer/rest/api/documents"
+    access_token = await get_access_token()
+    cert_id = await get_default_certificate_id(access_token)
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-
-    # Документ передаётся в Base64
     content_b64 = base64.b64encode(file_content).decode()
 
     payload = {
@@ -101,7 +98,6 @@ async def sign_document(
         "Signature": {
             "Type": "CAdES",
             "Parameters": {
-                "Hash": "False",
                 "CADESType": "BES",
                 "IsDetached": "True",
             },
@@ -110,33 +106,28 @@ async def sign_document(
         },
     }
 
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json; charset=utf-8",
+    }
+
     async with httpx.AsyncClient(timeout=60) as client:
-        response = await client.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        # Ответ — Base64-строка подписи
-        signature_b64 = response.json()
-        return base64.b64decode(signature_b64)
+        response = await client.post(
+            f"{DSS_BASE_URL}/SignServer/rest/api/documents",
+            headers=headers,
+            json=payload,
+        )
+        if response.status_code != 200:
+            raise Exception(f"Ошибка подписания: {response.status_code} {response.text}")
+        result = response.json()
+        sig_b64 = result.get("Signature") or result.get("Content") or result
+        if isinstance(sig_b64, str):
+            return base64.b64decode(sig_b64)
+        raise Exception(f"Неожиданный формат ответа DSS: {result}")
 
 
 async def sign_file(file_content: bytes) -> bytes:
     """
-    Полный цикл подписания:
-    1. Получить токен
-    2. Получить cert_id сертификата по умолчанию
-    3. Подписать документ
-    Возвращает байты отделённой подписи (.sig)
+    Обёртка для обратной совместимости с существующими endpoint-ами.
     """
-    # Шаг 1: получить токен
-    access_token = await get_access_token()
-
-    # Шаг 2: получить список сертификатов, найти default
-    certs = await get_certificates(access_token)
-    cert_id = 0  # 0 = сертификат по умолчанию
-    for cert in certs:
-        if cert.get("IsDefault"):
-            cert_id = cert.get("Id", 0)
-            break
-
-    # Шаг 3: подписать
-    signature = await sign_document(file_content, access_token, cert_id)
-    return signature
+    return await sign_document(file_content, "document")
