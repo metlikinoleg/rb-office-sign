@@ -1,10 +1,10 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import Response
 import httpx
 import os
 import base64
 from dotenv import load_dotenv
-from dss_client import sign_file, sign_document, get_access_token, get_certificates
+from dss_client import sign_document, get_access_token, get_certificates
 
 load_dotenv()
 
@@ -66,55 +66,55 @@ async def sign_test():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/dss/sign")
+@app.post("/api/dss/sign")
 async def sign_endpoint(file: UploadFile = File(...)):
-    """
-    Принимает файл, подписывает через DSS,
-    возвращает отделённую подпись (.sig).
-    """
+    """Принимает файл, возвращает отделённую подпись (.sig)."""
     try:
         file_content = await file.read()
-        signature = await sign_file(file_content)
-        filename = f"{file.filename}.sig"
+        sig_bytes = await sign_document(file_content, file.filename)
         return Response(
-            content=signature,
+            content=sig_bytes,
             media_type="application/octet-stream",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            headers={
+                "Content-Disposition": f'attachment; filename="{file.filename}.sig"'
+            },
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/callback")
+@app.post("/api/callback")
 async def onlyoffice_callback(request: Request):
     """
-    Принимает callback от OnlyOffice Document Server.
-    Статус 2 = документ готов к сохранению.
+    Callback от OnlyOffice при сохранении документа.
+    Статус 2 = документ готов к скачиванию и подписанию.
     """
     body = await request.json()
     status = body.get("status")
-    download_url = body.get("url")
-    key = body.get("key")
 
-    if status == 2 and download_url:
+    if status == 2:
+        download_url = body.get("url")
+        key = body.get("key", "unknown")
+
+        # Скачиваем документ от OnlyOffice
         async with httpx.AsyncClient() as client:
             response = await client.get(download_url)
             file_content = response.content
 
-        # Подписываем файл
-        try:
-            signature = await sign_file(file_content)
-            # Сохраняем документ и подпись
-            file_path = f"/tmp/{key}.docx"
-            sig_path = f"/tmp/{key}.docx.sig"
-            with open(file_path, "wb") as f:
-                f.write(file_content)
-            with open(sig_path, "wb") as f:
-                f.write(signature)
-        except Exception as e:
-            # Логируем ошибку но возвращаем 0 чтобы OnlyOffice не ретраил
-            print(f"Signing error: {e}")
+        # Подписываем
+        sig_bytes = await sign_document(file_content, f"{key}.docx")
 
-        return JSONResponse({"error": 0})
+        # Сохраняем подпись рядом с документом
+        sig_path = f"/tmp/{key}.sig"
+        with open(sig_path, "wb") as f:
+            f.write(sig_bytes)
 
-    return JSONResponse({"error": 0})
+        return {
+            "error": 0,
+            "signed": True,
+            "signature_size": len(sig_bytes),
+            "sig_path": sig_path,
+        }
+
+    # Остальные статусы — просто подтверждаем
+    return {"error": 0}
