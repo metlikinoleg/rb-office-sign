@@ -66,7 +66,7 @@ async def sign_test():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/dss/sign")
+@app.post("/dss/sign")
 async def sign_endpoint(file: UploadFile = File(...)):
     """Принимает файл, возвращает отделённую подпись (.sig)."""
     try:
@@ -83,7 +83,7 @@ async def sign_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/callback")
+@app.post("/callback")
 async def onlyoffice_callback(request: Request):
     """
     Callback от OnlyOffice при сохранении документа.
