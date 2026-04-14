@@ -120,9 +120,13 @@ async def sign_document(file_content: bytes, file_name: str) -> bytes:
         if response.status_code != 200:
             raise Exception(f"Ошибка подписания: {response.status_code} {response.text}")
         result = response.json()
-        sig_b64 = result.get("Signature") or result.get("Content") or result
-        if isinstance(sig_b64, str):
-            return base64.b64decode(sig_b64)
+        # DSS может вернуть строку base64 напрямую или объект с ключом
+        if isinstance(result, str):
+            return base64.b64decode(result)
+        if isinstance(result, dict):
+            sig_b64 = result.get("Signature") or result.get("Content")
+            if sig_b64:
+                return base64.b64decode(sig_b64)
         raise Exception(f"Неожиданный формат ответа DSS: {result}")
 
 
