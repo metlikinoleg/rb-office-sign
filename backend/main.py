@@ -5,6 +5,7 @@ import os
 import json
 import base64
 import uuid
+import jwt
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from dss_client import sign_document, get_access_token, get_certificates, verify_signature
@@ -329,7 +330,7 @@ async def verify_doc(doc_id: str):
 
 @app.get("/documents/{doc_id}/editor-config")
 async def editor_config(doc_id: str):
-    """Возвращает конфиг для OnlyOffice JS API."""
+    """Возвращает конфиг для OnlyOffice JS API, подписанный JWT."""
     docs = _read_metadata()
     doc = _find_doc(docs, doc_id)
     if not doc:
@@ -338,17 +339,24 @@ async def editor_config(doc_id: str):
     ext = os.path.splitext(doc["filename"])[1].lstrip(".")
     editor_key = f"{doc_id}_{int(datetime.now(timezone.utc).timestamp())}"
 
-    return {
+    # URL доступный из контейнера OnlyOffice через Docker-сеть
+    backend_url = "http://rb-office-backend:8000"
+
+    config = {
         "document": {
             "fileType": ext,
             "key": editor_key,
             "title": doc["filename"],
-            "url": f"http://localhost:8000/documents/{doc_id}/download",
+            "url": f"{backend_url}/documents/{doc_id}/download",
         },
         "editorConfig": {
-            "callbackUrl": "http://localhost:8000/callback",
+            "callbackUrl": f"{backend_url}/callback",
             "mode": "edit",
             "lang": "ru",
         },
         "documentType": _get_document_type(ext),
     }
+
+    config["token"] = jwt.encode(config, JWT_SECRET, algorithm="HS256")
+
+    return config
