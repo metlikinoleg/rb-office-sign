@@ -231,6 +231,8 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+  height: 48px;
+  box-sizing: border-box;
 }
 
 .editor-toolbar .doc-title {
@@ -243,7 +245,9 @@ body {
 }
 
 #editor-container {
-  height: calc(100vh - 53px);
+  height: calc(100vh - 48px);
+  width: 100%;
+  position: relative;
 }
 
 /* Spinner */
