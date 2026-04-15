@@ -9,7 +9,7 @@
 </head>
 <body style="height:100%;margin:0;overflow:hidden">
 
-<div class="editor-toolbar">
+<div class="editor-toolbar" id="editorToolbar">
   <button class="btn btn-secondary" onclick="location.href='index.html'">&larr; Назад</button>
   <span class="doc-title" id="docTitle">Загрузка...</span>
   <button class="btn btn-success" id="btnSign" onclick="signDoc()">Подписать</button>
@@ -34,11 +34,12 @@ const API = '/api';
 const params = new URLSearchParams(window.location.search);
 const docId = params.get('id');
 
-function toast(msg, type = 'success') {
-  const el = document.getElementById('toast');
+function toast(msg, type) {
+  type = type || 'success';
+  var el = document.getElementById('toast');
   el.textContent = msg;
   el.className = 'toast toast-' + type + ' visible';
-  setTimeout(() => el.classList.remove('visible'), 3000);
+  setTimeout(function() { el.classList.remove('visible'); }, 3000);
 }
 
 function showModal(title, body) {
@@ -52,7 +53,7 @@ function closeModal() {
   document.getElementById('modal').classList.remove('active');
 }
 
-document.getElementById('modal').addEventListener('click', e => {
+document.getElementById('modal').addEventListener('click', function(e) {
   if (e.target === e.currentTarget) closeModal();
 });
 
@@ -62,29 +63,60 @@ if (!docId) {
   initEditor();
 }
 
+function fixEditorHeight() {
+  var frame = document.querySelector('iframe[name="frameEditor"]');
+  if (frame) {
+    var toolbar = document.querySelector('.editor-toolbar');
+    var h = toolbar ? toolbar.offsetHeight : 48;
+    frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
+    frame.style.setProperty('width', '100%', 'important');
+    frame.style.setProperty('border', 'none', 'important');
+    frame.style.setProperty('display', 'block', 'important');
+  }
+}
+
 async function initEditor() {
   try {
-    const res = await fetch(API + '/documents/' + docId + '/editor-config');
+    var res = await fetch(API + '/documents/' + docId + '/editor-config');
     if (!res.ok) throw new Error(await res.text());
-    const config = await res.json();
+    var config = await res.json();
 
     document.getElementById('docTitle').textContent = config.document.title;
 
+    // Calculate pixel height for OnlyOffice
+    var toolbarEl = document.querySelector('.editor-toolbar');
+    var editorH = window.innerHeight - (toolbarEl ? toolbarEl.offsetHeight : 48);
+    config.height = editorH + 'px';
+    config.width = '100%';
+    config.events = {
+      onAppReady: fixEditorHeight
+    };
+
     new DocsAPI.DocEditor('editor-container', config);
+
+    // Also poll as fallback since OnlyOffice may reset iframe dimensions
+    var attempts = 0;
+    var timer = setInterval(function() {
+      fixEditorHeight();
+      attempts++;
+      if (attempts > 50) clearInterval(timer);
+    }, 200);
+
+    window.addEventListener('resize', fixEditorHeight);
   } catch (e) {
     document.getElementById('docTitle').textContent = 'Ошибка загрузки: ' + e.message;
   }
 }
 
 async function signDoc() {
-  const btn = document.getElementById('btnSign');
+  var btn = document.getElementById('btnSign');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Подписание...';
   try {
-    const res = await fetch(API + '/documents/' + docId + '/sign', { method: 'POST' });
+    var res = await fetch(API + '/documents/' + docId + '/sign', { method: 'POST' });
     if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    toast('Документ подпис��н: ' + (data.signer || ''));
+    var data = await res.json();
+    toast('Документ подписан: ' + (data.signer || ''));
   } catch (e) {
     toast('Ошибка подписания: ' + e.message, 'error');
   }
@@ -93,13 +125,13 @@ async function signDoc() {
 }
 
 async function verifyDoc() {
-  const btn = document.getElementById('btnVerify');
+  var btn = document.getElementById('btnVerify');
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span>Проверка...';
   try {
-    const res = await fetch(API + '/documents/' + docId + '/verify', { method: 'POST' });
+    var res = await fetch(API + '/documents/' + docId + '/verify', { method: 'POST' });
     if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
+    var data = await res.json();
     showModal('Результат проверки подписи', data);
   } catch (e) {
     toast('Ошибка проверки: ' + e.message, 'error');
