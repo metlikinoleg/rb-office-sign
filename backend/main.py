@@ -1,8 +1,11 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 import httpx
 import os
+import json
 import base64
+import uuid
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from dss_client import sign_document, get_access_token, get_certificates, verify_signature
 
@@ -13,9 +16,45 @@ app = FastAPI(title="RB-Office Sign API")
 JWT_SECRET = os.getenv("JWT_SECRET")
 ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL")
 SIGNATURES_DIR = os.getenv("SIGNATURES_DIR", "./signatures")
+DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "./documents")
 
 os.makedirs(SIGNATURES_DIR, exist_ok=True)
+os.makedirs(DOCUMENTS_DIR, exist_ok=True)
 
+METADATA_FILE = os.path.join(DOCUMENTS_DIR, "metadata.json")
+
+
+def _read_metadata() -> list:
+    if not os.path.isfile(METADATA_FILE):
+        return []
+    with open(METADATA_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_metadata(data: list):
+    with open(METADATA_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def _find_doc(docs: list, doc_id: str) -> dict | None:
+    for d in docs:
+        if d["id"] == doc_id:
+            return d
+    return None
+
+
+def _get_document_type(ext: str) -> str:
+    ext = ext.lower().lstrip(".")
+    if ext in ("doc", "docx", "odt", "rtf", "txt", "html", "htm", "pdf"):
+        return "word"
+    if ext in ("xls", "xlsx", "ods", "csv"):
+        return "cell"
+    if ext in ("ppt", "pptx", "odp"):
+        return "slide"
+    return "word"
+
+
+# ── Health ──────────────────────────────────────────────────────
 
 @app.get("/health")
 async def health():
@@ -27,12 +66,11 @@ async def root():
     return {"message": "RB-Office Sign API is running"}
 
 
+# ── DSS endpoints ──────────────────────────────────────────────
+
 @app.get("/dss/check")
 async def dss_check():
-    """
-    Проверяет подключение к DSS:
-    получает токен и список сертификатов.
-    """
+    """Проверяет подключение к DSS: получает токен и список сертификатов."""
     try:
         token = await get_access_token()
         certs = await get_certificates(token)
@@ -86,43 +124,6 @@ async def sign_endpoint(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/callback")
-async def onlyoffice_callback(request: Request):
-    """
-    Callback от OnlyOffice при сохранении документа.
-    Статус 2 = документ готов к скачиванию и подписанию.
-    """
-    body = await request.json()
-    status = body.get("status")
-
-    if status == 2:
-        download_url = body.get("url")
-        key = body.get("key", "unknown")
-
-        # Скачиваем документ от OnlyOffice
-        async with httpx.AsyncClient() as client:
-            response = await client.get(download_url)
-            file_content = response.content
-
-        # Подписываем
-        sig_bytes = await sign_document(file_content, f"{key}.docx")
-
-        # Сохраняем подпись в постоянную директорию
-        sig_path = os.path.join(SIGNATURES_DIR, f"{key}.sig")
-        with open(sig_path, "wb") as f:
-            f.write(sig_bytes)
-
-        return {
-            "error": 0,
-            "signed": True,
-            "signature_size": len(sig_bytes),
-            "sig_path": sig_path,
-        }
-
-    # Остальные статусы — просто подтверждаем
-    return {"error": 0}
-
-
 @app.get("/dss/signatures/{key}")
 async def get_signature(key: str):
     """Отдаёт .sig файл по ключу документа."""
@@ -143,11 +144,7 @@ async def verify_endpoint(
     file: UploadFile = File(..., description="Исходный документ"),
     signature: UploadFile = File(..., description="Файл подписи (.sig)"),
 ):
-    """
-    Проверяет отделённую подпись.
-    Принимает два файла: оригинальный документ и .sig-файл.
-    Возвращает результат верификации с информацией о подписанте.
-    """
+    """Проверяет отделённую подпись (два файла: документ + .sig)."""
     try:
         file_content = await file.read()
         sig_content = await signature.read()
@@ -155,3 +152,203 @@ async def verify_endpoint(
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── OnlyOffice callback ───────────────────────────────────────
+
+@app.post("/callback")
+async def onlyoffice_callback(request: Request):
+    """
+    Callback от OnlyOffice при сохранении документа.
+    Статус 2 = документ готов к скачиванию и подписанию.
+    """
+    body = await request.json()
+    status = body.get("status")
+
+    if status == 2:
+        download_url = body.get("url")
+        key = body.get("key", "unknown")
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(download_url)
+            file_content = response.content
+
+        sig_bytes = await sign_document(file_content, f"{key}.docx")
+
+        sig_path = os.path.join(SIGNATURES_DIR, f"{key}.sig")
+        with open(sig_path, "wb") as f:
+            f.write(sig_bytes)
+
+        return {
+            "error": 0,
+            "signed": True,
+            "signature_size": len(sig_bytes),
+            "sig_path": sig_path,
+        }
+
+    return {"error": 0}
+
+
+# ── Document management ───────────────────────────────────────
+
+@app.post("/documents/upload")
+async def upload_document(file: UploadFile = File(...)):
+    """Загружает документ, сохраняет на диск, добавляет в metadata.json."""
+    doc_id = str(uuid.uuid4())
+    ext = os.path.splitext(file.filename or "doc")[1]
+    stored_name = f"{doc_id}{ext}"
+    file_path = os.path.join(DOCUMENTS_DIR, stored_name)
+
+    content = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(content)
+
+    now = datetime.now(timezone.utc).isoformat()
+    docs = _read_metadata()
+    docs.append({
+        "id": doc_id,
+        "filename": file.filename,
+        "stored_name": stored_name,
+        "uploaded_at": now,
+        "signed": False,
+        "signature_time": None,
+        "signer": None,
+    })
+    _write_metadata(docs)
+
+    return {"id": doc_id, "filename": file.filename, "uploaded_at": now}
+
+
+@app.get("/documents")
+async def list_documents():
+    """Список всех документов."""
+    return _read_metadata()
+
+
+@app.get("/documents/{doc_id}/download")
+async def download_document(doc_id: str):
+    """Отдаёт файл документа."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+    return FileResponse(
+        file_path,
+        filename=doc["filename"],
+        media_type="application/octet-stream",
+    )
+
+
+@app.delete("/documents/{doc_id}")
+async def delete_document(doc_id: str):
+    """Удаляет документ и его подпись (если есть)."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if os.path.isfile(file_path):
+        os.remove(file_path)
+
+    sig_path = os.path.join(SIGNATURES_DIR, f"{doc_id}.sig")
+    if os.path.isfile(sig_path):
+        os.remove(sig_path)
+
+    docs = [d for d in docs if d["id"] != doc_id]
+    _write_metadata(docs)
+
+    return {"status": "deleted", "id": doc_id}
+
+
+@app.post("/documents/{doc_id}/sign")
+async def sign_doc(doc_id: str):
+    """Подписывает документ через DSS, сохраняет подпись, обновляет метаданные."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+
+    sig_bytes = await sign_document(file_content, doc["filename"])
+
+    sig_path = os.path.join(SIGNATURES_DIR, f"{doc_id}.sig")
+    with open(sig_path, "wb") as f:
+        f.write(sig_bytes)
+
+    # Верифицируем чтобы получить информацию о подписанте
+    verify_result = await verify_signature(file_content, sig_bytes)
+
+    doc["signed"] = True
+    doc["signature_time"] = verify_result.get("signing_time")
+    doc["signer"] = verify_result.get("signer", {}).get("subject")
+    _write_metadata(docs)
+
+    return {
+        "status": "signed",
+        "id": doc_id,
+        "signature_size": len(sig_bytes),
+        "signer": doc["signer"],
+        "signature_time": doc["signature_time"],
+    }
+
+
+@app.post("/documents/{doc_id}/verify")
+async def verify_doc(doc_id: str):
+    """Проверяет подпись документа."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    sig_path = os.path.join(SIGNATURES_DIR, f"{doc_id}.sig")
+    if not os.path.isfile(sig_path):
+        raise HTTPException(status_code=404, detail="Подпись не найдена")
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+    with open(sig_path, "rb") as f:
+        sig_content = f.read()
+
+    result = await verify_signature(file_content, sig_content)
+    return result
+
+
+@app.get("/documents/{doc_id}/editor-config")
+async def editor_config(doc_id: str):
+    """Возвращает конфиг для OnlyOffice JS API."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    ext = os.path.splitext(doc["filename"])[1].lstrip(".")
+    editor_key = f"{doc_id}_{int(datetime.now(timezone.utc).timestamp())}"
+
+    return {
+        "document": {
+            "fileType": ext,
+            "key": editor_key,
+            "title": doc["filename"],
+            "url": f"http://localhost:8000/documents/{doc_id}/download",
+        },
+        "editorConfig": {
+            "callbackUrl": "http://localhost:8000/callback",
+            "mode": "edit",
+            "lang": "ru",
+        },
+        "documentType": _get_document_type(ext),
+    }

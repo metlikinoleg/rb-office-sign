@@ -13,6 +13,12 @@ services:
       - ../backend/.env
     volumes:
       - /tmp/rb-office:/tmp
+      - rb-office-documents:/app/documents
+      - rb-office-signatures:/app/signatures
+
+volumes:
+  rb-office-documents:
+  rb-office-signatures:
 
 networks:
   default:
