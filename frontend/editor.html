@@ -63,28 +63,12 @@ if (!docId) {
   initEditor();
 }
 
-function fixEditorHeight() {
-  // Fix iframe inside editor-container
-  var frame = document.querySelector('iframe[name="frameEditor"]');
-  if (!frame) frame = document.querySelector('#editor-container iframe');
-  if (frame) {
-    var toolbar = document.querySelector('.editor-toolbar');
-    var h = toolbar ? toolbar.offsetHeight : 48;
-    var target = (window.innerHeight - h) + 'px';
-    frame.style.setProperty('height', target, 'important');
-    frame.style.setProperty('width', '100%', 'important');
-    frame.style.setProperty('border', 'none', 'important');
-    frame.style.setProperty('display', 'block', 'important');
-  }
-  // Also ensure the container div created by OnlyOffice has full height
-  var container = document.getElementById('editor-container');
-  if (container) {
-    var firstDiv = container.querySelector('div');
-    if (firstDiv) {
-      firstDiv.style.setProperty('height', '100%', 'important');
-    }
-  }
-}
+// Inject persistent CSS rule for iframe sizing — survives DOM manipulation
+(function() {
+  var style = document.createElement('style');
+  style.textContent = 'iframe[name="frameEditor"] { height: calc(100vh - 48px) !important; width: 100% !important; border: none !important; display: block !important; }';
+  document.head.appendChild(style);
+})();
 
 async function initEditor() {
   try {
@@ -94,26 +78,34 @@ async function initEditor() {
 
     document.getElementById('docTitle').textContent = config.document.title;
 
-    // Calculate pixel height for OnlyOffice
     var toolbarEl = document.querySelector('.editor-toolbar');
     var editorH = window.innerHeight - (toolbarEl ? toolbarEl.offsetHeight : 48);
     config.height = editorH + 'px';
     config.width = '100%';
-    config.events = {
-      onAppReady: fixEditorHeight
-    };
 
     new DocsAPI.DocEditor('editor-container', config);
 
-    // Poll aggressively — OnlyOffice may reset iframe dimensions multiple times
+    // Also poll with inline function to apply via JS as backup
     var attempts = 0;
     var timer = setInterval(function() {
-      fixEditorHeight();
+      var frame = document.querySelector('iframe[name="frameEditor"]');
+      if (frame) {
+        var tb = document.querySelector('.editor-toolbar');
+        var h = tb ? tb.offsetHeight : 48;
+        frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
+      }
       attempts++;
-      if (attempts > 150) clearInterval(timer);  // 30 seconds of polling
+      if (attempts > 150) clearInterval(timer);
     }, 200);
 
-    window.addEventListener('resize', fixEditorHeight);
+    window.addEventListener('resize', function() {
+      var frame = document.querySelector('iframe[name="frameEditor"]');
+      if (frame) {
+        var tb = document.querySelector('.editor-toolbar');
+        var h = tb ? tb.offsetHeight : 48;
+        frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
+      }
+    });
   } catch (e) {
     document.getElementById('docTitle').textContent = 'Ошибка загрузки: ' + e.message;
   }
