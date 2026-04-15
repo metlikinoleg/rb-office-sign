@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RB-Office — Редактор</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="http://85.239.61.19/web-apps/apps/api/documents/api.js"></script>
+</head>
+<body>
+
+<div class="editor-toolbar">
+  <button class="btn btn-secondary" onclick="location.href='index.html'">&larr; Назад</button>
+  <span class="doc-title" id="docTitle">Загрузка...</span>
+  <button class="btn btn-success" id="btnSign" onclick="signDoc()">Подписать</button>
+  <button class="btn btn-info" id="btnVerify" onclick="verifyDoc()">Проверить подпись</button>
+</div>
+
+<div id="editor-container"></div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h3 id="modalTitle"></h3>
+    <pre id="modalBody"></pre>
+    <button class="btn btn-secondary close-btn" onclick="closeModal()">Закрыть</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/api';
+const params = new URLSearchParams(window.location.search);
+const docId = params.get('id');
+
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast toast-' + type + ' visible';
+  setTimeout(() => el.classList.remove('visible'), 3000);
+}
+
+function showModal(title, body) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').textContent =
+    typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+  document.getElementById('modal').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
+
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+if (!docId) {
+  document.getElementById('docTitle').textContent = 'Ошибка: не указан ID документа';
+} else {
+  initEditor();
+}
+
+async function initEditor() {
+  try {
+    const res = await fetch(API + '/documents/' + docId + '/editor-config');
+    if (!res.ok) throw new Error(await res.text());
+    const config = await res.json();
+
+    document.getElementById('docTitle').textContent = config.document.title;
+
+    new DocsAPI.DocEditor('editor-container', config);
+  } catch (e) {
+    document.getElementById('docTitle').textContent = 'Ошибка загрузки: ' + e.message;
+  }
+}
+
+async function signDoc() {
+  const btn = document.getElementById('btnSign');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Подписание...';
+  try {
+    const res = await fetch(API + '/documents/' + docId + '/sign', { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    toast('Документ подпис��н: ' + (data.signer || ''));
+  } catch (e) {
+    toast('Ошибка подписания: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Подписать';
+}
+
+async function verifyDoc() {
+  const btn = document.getElementById('btnVerify');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Проверка...';
+  try {
+    const res = await fetch(API + '/documents/' + docId + '/verify', { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    showModal('Результат проверки подписи', data);
+  } catch (e) {
+    toast('Ошибка проверки: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Проверить подпись';
+}
+</script>
+</body>
+</html>

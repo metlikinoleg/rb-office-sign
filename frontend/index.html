@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RB-Office</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="header">
+  <h1>RB-Office</h1>
+</div>
+
+<div class="container">
+  <div class="upload-area" id="uploadArea">
+    <input type="file" id="fileInput">
+    <div class="label"><strong>Загрузить документ</strong> &mdash; нажмите или перетащите файл</div>
+  </div>
+
+  <table class="doc-table">
+    <thead>
+      <tr>
+        <th>Имя файла</th>
+        <th>Дата загрузки</th>
+        <th>Статус подписи</th>
+        <th>Действия</th>
+      </tr>
+    </thead>
+    <tbody id="docList"></tbody>
+  </table>
+
+  <div class="empty-state" id="emptyState" style="display:none;">Нет загруженных документов</div>
+</div>
+
+<!-- Modal -->
+<div class="modal-overlay" id="modal">
+  <div class="modal">
+    <h3 id="modalTitle"></h3>
+    <pre id="modalBody"></pre>
+    <button class="btn btn-secondary close-btn" onclick="closeModal()">Закрыть</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const API = '/api';
+
+function toast(msg, type = 'success') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast toast-' + type + ' visible';
+  setTimeout(() => el.classList.remove('visible'), 3000);
+}
+
+function showModal(title, body) {
+  document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalBody').textContent =
+    typeof body === 'string' ? body : JSON.stringify(body, null, 2);
+  document.getElementById('modal').classList.add('active');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('active');
+}
+
+document.getElementById('modal').addEventListener('click', e => {
+  if (e.target === e.currentTarget) closeModal();
+});
+
+// Upload
+const uploadArea = document.getElementById('uploadArea');
+const fileInput = document.getElementById('fileInput');
+
+uploadArea.addEventListener('click', () => fileInput.click());
+uploadArea.addEventListener('dragover', e => { e.preventDefault(); uploadArea.style.borderColor = '#4a90d9'; });
+uploadArea.addEventListener('dragleave', () => { uploadArea.style.borderColor = '#ccc'; });
+uploadArea.addEventListener('drop', e => {
+  e.preventDefault();
+  uploadArea.style.borderColor = '#ccc';
+  if (e.dataTransfer.files.length) uploadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', () => {
+  if (fileInput.files.length) uploadFile(fileInput.files[0]);
+});
+
+async function uploadFile(file) {
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const res = await fetch(API + '/documents/upload', { method: 'POST', body: fd });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Документ загружен');
+    loadDocuments();
+  } catch (e) {
+    toast('Ошибка загрузки: ' + e.message, 'error');
+  }
+  fileInput.value = '';
+}
+
+// Document list
+async function loadDocuments() {
+  try {
+    const res = await fetch(API + '/documents');
+    const docs = await res.json();
+    renderDocuments(docs);
+  } catch (e) {
+    toast('Ошибка загрузки списка', 'error');
+  }
+}
+
+function formatDate(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  return d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
+function renderDocuments(docs) {
+  const tbody = document.getElementById('docList');
+  const empty = document.getElementById('emptyState');
+
+  if (!docs.length) {
+    tbody.innerHTML = '';
+    empty.style.display = '';
+    return;
+  }
+  empty.style.display = 'none';
+
+  tbody.innerHTML = docs.map(doc => `
+    <tr>
+      <td class="filename">${esc(doc.filename)}</td>
+      <td class="date">${formatDate(doc.uploaded_at)}</td>
+      <td>${doc.signed
+        ? '<span class="badge badge-signed">Подписан' + (doc.signer ? ' (' + esc(doc.signer) + ')' : '') + '</span>'
+        : '<span class="badge badge-unsigned">Не подписан</span>'
+      }</td>
+      <td class="actions">
+        <button class="btn btn-primary" onclick="openEditor('${doc.id}')">Открыть</button>
+        <button class="btn btn-success" onclick="signDoc('${doc.id}', this)">Подписать</button>
+        <button class="btn btn-info" onclick="verifyDoc('${doc.id}', this)" ${doc.signed ? '' : 'disabled'}>Проверить</button>
+        <button class="btn btn-danger" onclick="deleteDoc('${doc.id}', this)">Удалить</button>
+      </td>
+    </tr>
+  `).join('');
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function openEditor(id) {
+  window.location.href = 'editor.html?id=' + id;
+}
+
+async function signDoc(id, btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Подписание...';
+  try {
+    const res = await fetch(API + '/documents/' + id + '/sign', { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    toast('Документ подписан: ' + (data.signer || ''));
+    loadDocuments();
+  } catch (e) {
+    toast('Ошибка подписания: ' + e.message, 'error');
+    btn.disabled = false;
+    btn.textContent = 'Подписать';
+  }
+}
+
+async function verifyDoc(id, btn) {
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span>Проверка...';
+  try {
+    const res = await fetch(API + '/documents/' + id + '/verify', { method: 'POST' });
+    if (!res.ok) throw new Error(await res.text());
+    const data = await res.json();
+    showModal('Результат проверки подписи', data);
+  } catch (e) {
+    toast('Ошибка проверки: ' + e.message, 'error');
+  }
+  btn.disabled = false;
+  btn.textContent = 'Проверить';
+}
+
+async function deleteDoc(id, btn) {
+  if (!confirm('Удалить документ?')) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch(API + '/documents/' + id, { method: 'DELETE' });
+    if (!res.ok) throw new Error(await res.text());
+    toast('Документ удалён');
+    loadDocuments();
+  } catch (e) {
+    toast('Ошибка удаления: ' + e.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+loadDocuments();
+</script>
+</body>
+</html>
