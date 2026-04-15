@@ -160,32 +160,67 @@ async def verify_endpoint(
 @app.post("/callback")
 async def onlyoffice_callback(request: Request):
     """
-    Callback от OnlyOffice при сохранении документа.
-    Статус 2 = документ готов к скачиванию и подписанию.
+    Callback от OnlyOffice при событиях редактирования.
+    Статус 2 = документ сохранён, все пользователи вышли — скачиваем и сохраняем.
     """
     body = await request.json()
     status = body.get("status")
+    key = body.get("key", "unknown")
+    print(f"[CALLBACK] status={status} key={key} body={json.dumps(body, ensure_ascii=False)}")
 
     if status == 2:
         download_url = body.get("url")
-        key = body.get("key", "unknown")
+        if not download_url:
+            print(f"[CALLBACK] ERROR: status=2 but no URL in body")
+            return {"error": 0}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(download_url)
-            file_content = response.content
+        # Extract doc_id from key (format: "{uuid}_{timestamp}")
+        # UUID has 5 parts: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        parts = key.split("_")
+        doc_id = "_".join(parts[:-1]) if len(parts) > 1 else key
 
-        sig_bytes = await sign_document(file_content, f"{key}.docx")
+        docs = _read_metadata()
+        doc = _find_doc(docs, doc_id)
+        if not doc:
+            print(f"[CALLBACK] ERROR: document not found for doc_id={doc_id}")
+            return {"error": 0}
 
-        sig_path = os.path.join(SIGNATURES_DIR, f"{key}.sig")
-        with open(sig_path, "wb") as f:
-            f.write(sig_bytes)
+        # Download updated document from OnlyOffice
+        # URL may use internal hostname — try as-is first, then replace with container name
+        file_content = None
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            try:
+                response = await client.get(download_url)
+                response.raise_for_status()
+                file_content = response.content
+                print(f"[CALLBACK] Downloaded {len(file_content)} bytes from {download_url}")
+            except Exception as e:
+                print(f"[CALLBACK] Failed to download from {download_url}: {e}")
+                # Try replacing hostname with OnlyOffice container name
+                from urllib.parse import urlparse, urlunparse
+                parsed = urlparse(download_url)
+                alt_url = urlunparse(parsed._replace(netloc="onlyoffice"))
+                try:
+                    response = await client.get(alt_url)
+                    response.raise_for_status()
+                    file_content = response.content
+                    print(f"[CALLBACK] Downloaded {len(file_content)} bytes from {alt_url}")
+                except Exception as e2:
+                    print(f"[CALLBACK] Also failed from {alt_url}: {e2}")
 
-        return {
-            "error": 0,
-            "signed": True,
-            "signature_size": len(sig_bytes),
-            "sig_path": sig_path,
-        }
+        if file_content:
+            # Save updated file, overwriting the original
+            file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+            with open(file_path, "wb") as f:
+                f.write(file_content)
+            print(f"[CALLBACK] Saved updated document to {file_path}")
+        else:
+            print(f"[CALLBACK] Could not download document, skipping save")
+
+        return {"error": 0}
+
+    if status == 6:
+        print(f"[CALLBACK] Force save error for key={key}")
 
     return {"error": 0}
 
