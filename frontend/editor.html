@@ -7,16 +7,16 @@
   <link rel="stylesheet" href="style.css">
   <script src="http://85.239.61.19/web-apps/apps/api/documents/api.js"></script>
 </head>
-<body style="height:100%;margin:0;overflow:hidden">
+<body style="height:100%;margin:0;overflow:hidden;display:flex;flex-direction:column">
 
-<div class="editor-toolbar" id="editorToolbar">
+<div class="editor-toolbar" id="editorToolbar" style="flex-shrink:0">
   <button class="btn btn-secondary" onclick="location.href='index.html'">&larr; Назад</button>
   <span class="doc-title" id="docTitle">Загрузка...</span>
   <button class="btn btn-success" id="btnSign" onclick="signDoc()">Подписать</button>
   <button class="btn btn-info" id="btnVerify" onclick="verifyDoc()">Проверить подпись</button>
 </div>
 
-<div id="editor-container"></div>
+<div id="editor-container" style="flex:1;overflow:hidden"></div>
 
 <!-- Modal -->
 <div class="modal-overlay" id="modal">
@@ -64,14 +64,25 @@ if (!docId) {
 }
 
 function fixEditorHeight() {
+  // Fix iframe inside editor-container
   var frame = document.querySelector('iframe[name="frameEditor"]');
+  if (!frame) frame = document.querySelector('#editor-container iframe');
   if (frame) {
     var toolbar = document.querySelector('.editor-toolbar');
     var h = toolbar ? toolbar.offsetHeight : 48;
-    frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
+    var target = (window.innerHeight - h) + 'px';
+    frame.style.setProperty('height', target, 'important');
     frame.style.setProperty('width', '100%', 'important');
     frame.style.setProperty('border', 'none', 'important');
     frame.style.setProperty('display', 'block', 'important');
+  }
+  // Also ensure the container div created by OnlyOffice has full height
+  var container = document.getElementById('editor-container');
+  if (container) {
+    var firstDiv = container.querySelector('div');
+    if (firstDiv) {
+      firstDiv.style.setProperty('height', '100%', 'important');
+    }
   }
 }
 
@@ -94,12 +105,12 @@ async function initEditor() {
 
     new DocsAPI.DocEditor('editor-container', config);
 
-    // Also poll as fallback since OnlyOffice may reset iframe dimensions
+    // Poll aggressively — OnlyOffice may reset iframe dimensions multiple times
     var attempts = 0;
     var timer = setInterval(function() {
       fixEditorHeight();
       attempts++;
-      if (attempts > 50) clearInterval(timer);
+      if (attempts > 150) clearInterval(timer);  // 30 seconds of polling
     }, 200);
 
     window.addEventListener('resize', fixEditorHeight);
