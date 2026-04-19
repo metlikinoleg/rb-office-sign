@@ -6,11 +6,16 @@ import os
 import io
 import json
 import base64
+import logging
 import uuid
 import jwt
+from urllib.parse import quote
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from dss_client import sign_document, get_access_token, get_certificates, verify_signature
+
+logger = logging.getLogger("rb-office")
+logging.basicConfig(level=logging.INFO)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
@@ -594,9 +599,26 @@ async def _convert_to_pdf(doc_id: str, filename: str, ext: str) -> bytes:
         return pdf_resp.content
 
 
+# OnlyOffice ConvertService поддерживает конвертацию в PDF из office-форматов,
+# но не из plain text. Явный белый список — чтобы давать пользователю понятную ошибку.
+_PDF_CONVERTIBLE_EXTS = {
+    "docx", "doc", "odt", "rtf",
+    "xlsx", "xls", "ods", "csv",
+    "pptx", "ppt", "odp",
+    "pdf",
+}
+
+
+def _ascii_fallback(name: str) -> str:
+    """Грубый ASCII-фоллбек для filename= в Content-Disposition."""
+    return name.encode("ascii", "ignore").decode("ascii") or "document.pdf"
+
+
 @app.get("/documents/{doc_id}/download-pdf")
 async def download_pdf(doc_id: str):
     """Конвертирует документ в PDF и добавляет страницу-штамп с информацией о подписи."""
+    logger.info("[download-pdf] start doc_id=%s", doc_id)
+
     docs = _read_metadata()
     doc = _find_doc(docs, doc_id)
     if not doc:
@@ -610,24 +632,44 @@ async def download_pdf(doc_id: str):
         raise HTTPException(status_code=404, detail="Файл не найден на диске")
 
     ext = os.path.splitext(doc["filename"])[1].lstrip(".").lower()
-    orig_pdf_bytes = await _convert_to_pdf(doc_id, doc["filename"], ext)
-    stamp_pdf_bytes = _build_signature_stamp_pdf(doc)
+    if ext not in _PDF_CONVERTIBLE_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Конвертация в PDF не поддерживается для файлов .{ext}",
+        )
 
-    writer = PdfWriter()
-    writer.append(fileobj=io.BytesIO(orig_pdf_bytes))
-    writer.append(fileobj=io.BytesIO(stamp_pdf_bytes))
+    try:
+        logger.info("[download-pdf] converting via OnlyOffice: filename=%r ext=%s", doc["filename"], ext)
+        orig_pdf_bytes = await _convert_to_pdf(doc_id, doc["filename"], ext)
+        logger.info("[download-pdf] converted: %d bytes", len(orig_pdf_bytes))
 
-    out = io.BytesIO()
-    writer.write(out)
-    out.seek(0)
+        stamp_pdf_bytes = _build_signature_stamp_pdf(doc)
+        logger.info("[download-pdf] stamp generated: %d bytes", len(stamp_pdf_bytes))
+
+        writer = PdfWriter()
+        writer.append(fileobj=io.BytesIO(orig_pdf_bytes))
+        writer.append(fileobj=io.BytesIO(stamp_pdf_bytes))
+        out = io.BytesIO()
+        writer.write(out)
+        out.seek(0)
+        logger.info("[download-pdf] merged: %d bytes", len(out.getvalue()))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[download-pdf] failed for doc_id=%s: %s", doc_id, e)
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {e}")
 
     base_name = os.path.splitext(doc["filename"])[0]
     out_name = f"{base_name}_signed.pdf"
+    ascii_name = _ascii_fallback(out_name)
+    # RFC 5987: filename= для ASCII-клиентов + filename*= для UTF-8.
+    # HTTP-заголовки должны быть латин-1, поэтому кириллицу — только через %-кодирование.
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(out_name)}"
 
     return StreamingResponse(
         out,
         media_type="application/pdf",
-        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+        headers={"Content-Disposition": disposition},
     )
 
 
