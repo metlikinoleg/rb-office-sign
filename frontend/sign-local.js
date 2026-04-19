@@ -13,6 +13,14 @@
   var CADESCOM_CADES_BES = 1;
   var CADESCOM_BASE64_TO_BINARY = 1;
 
+  // Экспорт сразу, до определения тел функций.
+  // Имена async function-деклараций хойстятся, поэтому ссылки валидны.
+  window.RbSignLocal = {
+    listCertificates: listCertificates,
+    signDocument: signDocument,
+    showCertificateDialog: showCertificateDialog,
+  };
+
   function ensurePlugin() {
     if (typeof cadesplugin === 'undefined') {
       throw new Error('Установите КриптоПро ЭЦП Browser plug-in (https://www.cryptopro.ru/products/cades/plugin)');
@@ -58,13 +66,11 @@
     var cades = ensurePlugin();
     await cades;
 
-    // 1. Скачиваем содержимое документа
     var res = await fetch(API + '/documents/' + docId + '/content-base64');
     if (!res.ok) throw new Error('Не удалось получить документ: ' + (await res.text()));
     var data = await res.json();
     var contentBase64 = data.content;
 
-    // 2. Находим сертификат по thumbprint
     var store = await cades.CreateObjectAsync('CAdESCOM.Store');
     await store.Open(
       CAPICOM_CURRENT_USER_STORE,
@@ -80,16 +86,13 @@
     }
     var cert = await found.Item(1);
 
-    // 3. Создаём CPSigner
     var signer = await cades.CreateObjectAsync('CAdESCOM.CPSigner');
     await signer.propset_Certificate(cert);
 
-    // 4. Создаём CadesSignedData
     var signedData = await cades.CreateObjectAsync('CAdESCOM.CadesSignedData');
     await signedData.propset_ContentEncoding(CADESCOM_BASE64_TO_BINARY);
     await signedData.propset_Content(contentBase64);
 
-    // 5. Подписываем (detached = true)
     var signature;
     try {
       signature = await signedData.SignCades(signer, CADESCOM_CADES_BES, true);
@@ -103,7 +106,6 @@
     }
     await store.Close();
 
-    // 6. Отправляем подпись на бэкенд
     var sendRes = await fetch(API + '/documents/' + docId + '/sign-local', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -220,10 +222,5 @@
     });
   }
 
-  window.RbSignLocal = {
-    listCertificates: listCertificates,
-    signDocument: signDocument,
-    showCertificateDialog: showCertificateDialog,
-  };
   console.log('[sign-local] RbSignLocal registered; cadesplugin=', typeof window.cadesplugin);
 })();
