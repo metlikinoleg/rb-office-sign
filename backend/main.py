@@ -495,8 +495,58 @@ def _extract_cn(subject: str) -> str:
     """Достаёт значение CN= из subject в стиле RFC 2253 / openssl."""
     if not subject:
         return ""
+    fields = _parse_subject(subject)
+    if "CN" in fields:
+        return fields["CN"].strip()
     m = re.search(r"(?:^|,\s*|/)CN=([^,/]+)", subject)
     return (m.group(1).strip() if m else subject).strip()
+
+
+def _parse_subject(subject: str) -> dict:
+    # Разбирает subject сертификата в стиле RFC 2253 — поля через запятую,
+    # значения могут быть в двойных кавычках, внутри которых "" означает
+    # одну литеральную кавычку. Ключи нормализуются в UPPERCASE.
+    result: dict = {}
+    if not subject:
+        return result
+    s = subject
+    i = 0
+    n = len(s)
+    while i < n:
+        while i < n and s[i] in " ,":
+            i += 1
+        if i >= n:
+            break
+        key_start = i
+        while i < n and s[i] != "=":
+            i += 1
+        if i >= n:
+            break
+        key = s[key_start:i].strip().upper()
+        i += 1  # пропускаем '='
+        if i < n and s[i] == '"':
+            i += 1
+            buf_chars = []
+            while i < n:
+                if s[i] == '"':
+                    if i + 1 < n and s[i + 1] == '"':
+                        buf_chars.append('"')
+                        i += 2
+                    else:
+                        i += 1
+                        break
+                else:
+                    buf_chars.append(s[i])
+                    i += 1
+            value = "".join(buf_chars)
+        else:
+            val_start = i
+            while i < n and s[i] != ",":
+                i += 1
+            value = s[val_start:i].strip()
+        if key:
+            result[key] = value
+    return result
 
 
 def _fmt_date_short(value: str) -> str:
@@ -579,7 +629,13 @@ def _build_signature_stamp_pdf(doc: dict) -> bytes:
     signer_info = doc.get("signer_info") or {}
     is_valid = bool(doc.get("signature_valid", True))
     subject_raw = signer_info.get("subject") or doc.get("signer") or ""
+    subject_fields = _parse_subject(subject_raw)
     cn = _extract_cn(subject_raw) or subject_raw or "—"
+    org_name = subject_fields.get("O", "").strip()
+    position = subject_fields.get("T", "").strip()
+    surname = subject_fields.get("SN", "").strip()
+    given_name = subject_fields.get("G", "").strip()
+    full_name = f"{surname} {given_name}".strip()
 
     # ── Стили абзацев для ячеек ─────────────────────────────────────
     st_header_title = ParagraphStyle(
@@ -678,9 +734,24 @@ def _build_signature_stamp_pdf(doc: dict) -> bytes:
                      text_color="#27500A" if is_valid else "#7A1A1A"),
     ]
 
-    org_cell = [Paragraph(cn, st_org)]
-    if subject_raw and subject_raw != cn:
-        org_cell += [Spacer(1, 1 * mm), Paragraph(subject_raw, st_org_sub)]
+    st_position = ParagraphStyle(
+        "position", fontName=font_regular, fontSize=8,
+        textColor=HexColor("#5F5E5A"), leading=10, spaceBefore=2,
+    )
+    st_name = ParagraphStyle(
+        "name", fontName=font_regular, fontSize=9,
+        textColor=HexColor("#1A1A1A"), leading=11, spaceBefore=2,
+    )
+
+    org_cell: list = []
+    if org_name:
+        org_cell.append(Paragraph(org_name, st_org))
+    if position:
+        org_cell.append(Paragraph(position, st_position))
+    if full_name:
+        org_cell.append(Paragraph(full_name, st_name))
+    if not org_cell:
+        org_cell.append(Paragraph(cn or "—", st_org))
 
     signer_row = [
         Paragraph("Отправитель", st_role),
