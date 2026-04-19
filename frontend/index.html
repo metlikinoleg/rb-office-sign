@@ -129,22 +129,31 @@ function renderDocuments(docs) {
   }
   empty.style.display = 'none';
 
-  tbody.innerHTML = docs.map(doc => `
-    <tr>
-      <td class="filename">${esc(doc.filename)}</td>
-      <td class="date">${formatDate(doc.uploaded_at)}</td>
-      <td>${doc.signed
-        ? '<span class="badge badge-signed">Подписан' + (doc.signer ? ' (' + esc(doc.signer) + ')' : '') + '</span>'
-        : '<span class="badge badge-unsigned">Не подписан</span>'
-      }</td>
-      <td class="actions">
+  tbody.innerHTML = docs.map(doc => {
+    const statusHtml = doc.signed
+      ? '<span class="badge badge-signed">Подписан' + (doc.signer ? ' (' + esc(doc.signer) + ')' : '') + '</span>'
+      : '<span class="badge badge-unsigned">Не подписан</span>';
+    const actions = doc.signed
+      ? `
+        <button class="btn btn-primary" onclick="openEditor('${doc.id}')">Открыть (просмотр)</button>
+        <button class="btn btn-info" onclick="verifyDoc('${doc.id}', this)">Проверить подпись</button>
+        <button class="btn btn-success" onclick="downloadPdf('${doc.id}')">Скачать PDF</button>
+        <button class="btn btn-danger" onclick="deleteDoc('${doc.id}', this)">Удалить</button>
+      `
+      : `
         <button class="btn btn-primary" onclick="openEditor('${doc.id}')">Открыть</button>
         <button class="btn btn-success" onclick="signDoc('${doc.id}', this)">Подписать</button>
-        <button class="btn btn-info" onclick="verifyDoc('${doc.id}', this)" ${doc.signed ? '' : 'disabled'}>Проверить</button>
         <button class="btn btn-danger" onclick="deleteDoc('${doc.id}', this)">Удалить</button>
-      </td>
-    </tr>
-  `).join('');
+      `;
+    return `
+      <tr>
+        <td class="filename">${esc(doc.filename)}</td>
+        <td class="date">${formatDate(doc.uploaded_at)}</td>
+        <td>${statusHtml}</td>
+        <td class="actions">${actions}</td>
+      </tr>
+    `;
+  }).join('');
 }
 
 function esc(s) {
@@ -155,6 +164,10 @@ function esc(s) {
 
 function openEditor(id) {
   window.location.href = 'editor.html?id=' + id;
+}
+
+function downloadPdf(id) {
+  window.location.href = API + '/documents/' + id + '/download-pdf';
 }
 
 function signDoc(id, btn) {

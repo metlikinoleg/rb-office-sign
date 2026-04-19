@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response, FileResponse, StreamingResponse
 from pydantic import BaseModel
 import httpx
 import os
+import io
 import json
 import base64
 import uuid
@@ -11,14 +12,40 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from dss_client import sign_document, get_access_token, get_certificates, verify_signature
 
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from reportlab.lib.colors import HexColor
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas as pdf_canvas
+from pypdf import PdfReader, PdfWriter
+
 load_dotenv()
 
 app = FastAPI(title="RB-Office Sign API")
 
 JWT_SECRET = os.getenv("JWT_SECRET")
 ONLYOFFICE_URL = os.getenv("ONLYOFFICE_URL")
+ONLYOFFICE_INTERNAL_URL = os.getenv("ONLYOFFICE_INTERNAL_URL", "http://onlyoffice")
+BACKEND_INTERNAL_URL = os.getenv("BACKEND_INTERNAL_URL", "http://rb-office-backend:8000")
 SIGNATURES_DIR = os.getenv("SIGNATURES_DIR", "./signatures")
 DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "./documents")
+
+# Шрифт с поддержкой кириллицы — устанавливается через пакет fonts-dejavu-core
+DEJAVU_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+DEJAVU_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+_font_registered = False
+
+
+def _register_fonts():
+    global _font_registered
+    if _font_registered:
+        return
+    if os.path.isfile(DEJAVU_PATH):
+        pdfmetrics.registerFont(TTFont("DejaVu", DEJAVU_PATH))
+    if os.path.isfile(DEJAVU_BOLD_PATH):
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", DEJAVU_BOLD_PATH))
+    _font_registered = True
 
 os.makedirs(SIGNATURES_DIR, exist_ok=True)
 os.makedirs(DOCUMENTS_DIR, exist_ok=True)
@@ -262,6 +289,16 @@ async def list_documents():
     return _read_metadata()
 
 
+@app.get("/documents/{doc_id}")
+async def get_document(doc_id: str):
+    """Возвращает полную запись о документе из metadata.json."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    return doc
+
+
 @app.get("/documents/{doc_id}/download")
 async def download_document(doc_id: str):
     """Отдаёт файл документа."""
@@ -325,9 +362,14 @@ async def sign_doc(doc_id: str):
     # Верифицируем чтобы получить информацию о подписанте
     verify_result = await verify_signature(file_content, sig_bytes)
 
+    signer_info = verify_result.get("signer", {}) or {}
     doc["signed"] = True
     doc["signature_time"] = verify_result.get("signing_time")
-    doc["signer"] = verify_result.get("signer", {}).get("subject")
+    doc["signer"] = signer_info.get("subject")
+    doc["signer_info"] = signer_info
+    doc["signature_type"] = verify_result.get("signature_type") or "CAdES-BES"
+    doc["signature_valid"] = bool(verify_result.get("valid"))
+    doc["verify_message"] = verify_result.get("message")
     _write_metadata(docs)
 
     return {
@@ -393,9 +435,14 @@ async def sign_doc_local(doc_id: str, payload: LocalSignPayload):
 
     verify_result = await verify_signature(file_content, sig_bytes)
 
+    signer_info = verify_result.get("signer", {}) or {}
     doc["signed"] = True
     doc["signature_time"] = verify_result.get("signing_time")
-    doc["signer"] = verify_result.get("signer", {}).get("subject")
+    doc["signer"] = signer_info.get("subject")
+    doc["signer_info"] = signer_info
+    doc["signature_type"] = verify_result.get("signature_type") or "CAdES-BES"
+    doc["signature_valid"] = bool(verify_result.get("valid"))
+    doc["verify_message"] = verify_result.get("message")
     _write_metadata(docs)
 
     return {
@@ -406,6 +453,182 @@ async def sign_doc_local(doc_id: str, payload: LocalSignPayload):
         "signature_time": doc["signature_time"],
         "verify": verify_result,
     }
+
+
+def _build_signature_stamp_pdf(doc: dict) -> bytes:
+    """Рендерит A4-страницу-штамп с данными подписи. Кириллица через DejaVuSans."""
+    _register_fonts()
+
+    signer_info = doc.get("signer_info") or {}
+    is_valid = bool(doc.get("signature_valid", True))
+
+    buf = io.BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=A4)
+    width, height = A4
+
+    font_regular = "DejaVu" if "DejaVu" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
+    font_bold = "DejaVu-Bold" if "DejaVu-Bold" in pdfmetrics.getRegisteredFontNames() else "Helvetica-Bold"
+
+    left = 20 * mm
+    right = width - 20 * mm
+    y = height - 30 * mm
+
+    # Заголовок
+    c.setFont(font_bold, 18)
+    c.drawString(left, y, "ЭЛЕКТРОННАЯ ПОДПИСЬ")
+    y -= 6 * mm
+    c.setStrokeColor(HexColor("#cccccc"))
+    c.setLineWidth(0.8)
+    c.line(left, y, right, y)
+    y -= 10 * mm
+
+    def draw_field(label: str, value: str):
+        nonlocal y
+        if y < 30 * mm:
+            return
+        c.setFont(font_bold, 10)
+        c.setFillColor(HexColor("#444444"))
+        c.drawString(left, y, label)
+        y -= 5 * mm
+        c.setFont(font_regular, 11)
+        c.setFillColor(HexColor("#000000"))
+        text = value or "—"
+        max_width = right - left
+        line = ""
+        for word in str(text).split():
+            probe = (line + " " + word).strip()
+            if c.stringWidth(probe, font_regular, 11) > max_width and line:
+                c.drawString(left, y, line)
+                y -= 5 * mm
+                line = word
+            else:
+                line = probe
+        if line:
+            c.drawString(left, y, line)
+            y -= 8 * mm
+
+    def fmt_range(a, b):
+        a = a or "—"
+        b = b or "—"
+        return f"{a}  —  {b}"
+
+    draw_field("Документ:", doc.get("filename") or "")
+    draw_field("Подписант (CN):", signer_info.get("subject") or doc.get("signer") or "")
+    draw_field("Издатель:", signer_info.get("issuer") or "")
+    draw_field("Отпечаток сертификата:", signer_info.get("thumbprint") or "")
+    draw_field("Серийный номер:", signer_info.get("serial") or "")
+    draw_field(
+        "Срок действия сертификата:",
+        fmt_range(signer_info.get("valid_from"), signer_info.get("valid_to")),
+    )
+    draw_field("Время подписания:", doc.get("signature_time") or "")
+    draw_field("Тип подписи:", doc.get("signature_type") or "CAdES-BES")
+
+    # Статус
+    y -= 4 * mm
+    if is_valid:
+        status_text = "ПОДПИСЬ ДЕЙСТВИТЕЛЬНА"
+        color = HexColor("#1a7f2e")
+    else:
+        status_text = "ПОДПИСЬ НЕ ДЕЙСТВИТЕЛЬНА"
+        color = HexColor("#c0222e")
+    c.setFont(font_bold, 14)
+    c.setFillColor(color)
+    c.drawString(left, y, status_text)
+
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+async def _convert_to_pdf(doc_id: str, filename: str, ext: str) -> bytes:
+    """Запрашивает у OnlyOffice ConvertService конвертацию документа в PDF."""
+    convert_key = f"{doc_id}_pdf_{int(datetime.now(timezone.utc).timestamp())}"
+
+    payload = {
+        "async": False,
+        "filetype": ext.lower().lstrip("."),
+        "outputtype": "pdf",
+        "key": convert_key,
+        "title": filename,
+        "url": f"{BACKEND_INTERNAL_URL}/documents/{doc_id}/download",
+    }
+    payload["token"] = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+    convert_url = f"{ONLYOFFICE_INTERNAL_URL}/ConvertService.ashx"
+
+    async with httpx.AsyncClient(timeout=120.0) as client:
+        resp = await client.post(
+            convert_url,
+            json=payload,
+            headers={"Accept": "application/json"},
+        )
+        if resp.status_code != 200:
+            raise HTTPException(
+                status_code=502,
+                detail=f"OnlyOffice ConvertService HTTP {resp.status_code}: {resp.text[:300]}",
+            )
+        try:
+            result = resp.json()
+        except Exception:
+            raise HTTPException(
+                status_code=502,
+                detail=f"OnlyOffice вернул не-JSON: {resp.text[:300]}",
+            )
+
+        if result.get("error"):
+            raise HTTPException(
+                status_code=502,
+                detail=f"OnlyOffice ConvertService error={result.get('error')}",
+            )
+
+        file_url = result.get("fileUrl")
+        if not file_url:
+            raise HTTPException(
+                status_code=502,
+                detail=f"ConvertService не вернул fileUrl: {result}",
+            )
+
+        pdf_resp = await client.get(file_url)
+        pdf_resp.raise_for_status()
+        return pdf_resp.content
+
+
+@app.get("/documents/{doc_id}/download-pdf")
+async def download_pdf(doc_id: str):
+    """Конвертирует документ в PDF и добавляет страницу-штамп с информацией о подписи."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    if not doc.get("signed"):
+        raise HTTPException(status_code=400, detail="Документ не подписан")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    ext = os.path.splitext(doc["filename"])[1].lstrip(".").lower()
+    orig_pdf_bytes = await _convert_to_pdf(doc_id, doc["filename"], ext)
+    stamp_pdf_bytes = _build_signature_stamp_pdf(doc)
+
+    writer = PdfWriter()
+    writer.append(fileobj=io.BytesIO(orig_pdf_bytes))
+    writer.append(fileobj=io.BytesIO(stamp_pdf_bytes))
+
+    out = io.BytesIO()
+    writer.write(out)
+    out.seek(0)
+
+    base_name = os.path.splitext(doc["filename"])[0]
+    out_name = f"{base_name}_signed.pdf"
+
+    return StreamingResponse(
+        out,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{out_name}"'},
+    )
 
 
 @app.post("/documents/{doc_id}/verify")
@@ -444,19 +667,29 @@ async def editor_config(doc_id: str):
     ext = os.path.splitext(doc["filename"])[1].lstrip(".")
     editor_key = f"{doc_id}_{int(datetime.now(timezone.utc).timestamp())}"
 
-    # URL доступный из контейнера OnlyOffice через Docker-сеть
-    backend_url = "http://rb-office-backend:8000"
+    backend_url = BACKEND_INTERNAL_URL
+    is_signed = bool(doc.get("signed"))
+
+    document_cfg = {
+        "fileType": ext,
+        "key": editor_key,
+        "title": doc["filename"],
+        "url": f"{backend_url}/documents/{doc_id}/download",
+    }
+    if is_signed:
+        document_cfg["permissions"] = {
+            "edit": False,
+            "download": True,
+            "print": True,
+            "review": False,
+            "comment": False,
+        }
 
     config = {
-        "document": {
-            "fileType": ext,
-            "key": editor_key,
-            "title": doc["filename"],
-            "url": f"{backend_url}/documents/{doc_id}/download",
-        },
+        "document": document_cfg,
         "editorConfig": {
             "callbackUrl": f"{backend_url}/callback",
-            "mode": "edit",
+            "mode": "view" if is_signed else "edit",
             "lang": "ru",
         },
         "documentType": _get_document_type(ext),

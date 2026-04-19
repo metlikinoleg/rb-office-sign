@@ -14,9 +14,12 @@
 <div class="editor-toolbar" id="editorToolbar" style="flex-shrink:0">
   <button class="btn btn-secondary" onclick="location.href='index.html'">&larr; Назад</button>
   <span class="doc-title" id="docTitle">Загрузка...</span>
-  <button class="btn btn-success" id="btnSign" onclick="signDoc()">Подписать</button>
+  <button class="btn btn-success" id="btnSign" onclick="signDoc()" style="display:none">Подписать</button>
+  <button class="btn btn-success" id="btnDownloadPdf" onclick="downloadPdf()" style="display:none">Скачать PDF</button>
   <button class="btn btn-info" id="btnVerify" onclick="verifyDoc()">Проверить подпись</button>
 </div>
+
+<div id="signedBanner" style="display:none;background:#e8f6ea;border-bottom:1px solid #b8dcc0;color:#1a5f27;padding:10px 16px;font-size:14px;flex-shrink:0"></div>
 
 <div id="editor-container" style="flex:1;overflow:hidden"></div>
 
@@ -72,6 +75,13 @@ if (!docId) {
   document.head.appendChild(style);
 })();
 
+function formatSignTime(iso) {
+  if (!iso) return '';
+  var d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+}
+
 async function initEditor() {
   try {
     var res = await fetch(API + '/documents/' + docId + '/editor-config');
@@ -80,34 +90,50 @@ async function initEditor() {
 
     document.getElementById('docTitle').textContent = config.document.title;
 
+    var isView = config.editorConfig && config.editorConfig.mode === 'view';
+    document.getElementById('btnSign').style.display = isView ? 'none' : '';
+    document.getElementById('btnDownloadPdf').style.display = isView ? '' : 'none';
+
+    if (isView) {
+      try {
+        var metaRes = await fetch(API + '/documents/' + docId);
+        if (metaRes.ok) {
+          var meta = await metaRes.json();
+          var banner = document.getElementById('signedBanner');
+          var signer = meta.signer || '—';
+          var time = formatSignTime(meta.signature_time);
+          banner.textContent = 'Документ подписан. Подписант: ' + signer +
+            (time ? '. Время подписания: ' + time : '') + '. Режим просмотра.';
+          banner.style.display = '';
+        }
+      } catch (e) {}
+    }
+
     var toolbarEl = document.querySelector('.editor-toolbar');
-    var editorH = window.innerHeight - (toolbarEl ? toolbarEl.offsetHeight : 48);
-    config.height = editorH + 'px';
+    var bannerEl = document.getElementById('signedBanner');
+    var chrome = (toolbarEl ? toolbarEl.offsetHeight : 48) + (bannerEl && bannerEl.style.display !== 'none' ? bannerEl.offsetHeight : 0);
+    config.height = (window.innerHeight - chrome) + 'px';
     config.width = '100%';
 
     new DocsAPI.DocEditor('editor-container', config);
 
-    // Also poll with inline function to apply via JS as backup
+    function applyFrameHeight() {
+      var frame = document.querySelector('iframe[name="frameEditor"]');
+      if (!frame) return;
+      var tb = document.querySelector('.editor-toolbar');
+      var bn = document.getElementById('signedBanner');
+      var h = (tb ? tb.offsetHeight : 48) + (bn && bn.style.display !== 'none' ? bn.offsetHeight : 0);
+      frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
+    }
+
     var attempts = 0;
     var timer = setInterval(function() {
-      var frame = document.querySelector('iframe[name="frameEditor"]');
-      if (frame) {
-        var tb = document.querySelector('.editor-toolbar');
-        var h = tb ? tb.offsetHeight : 48;
-        frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
-      }
+      applyFrameHeight();
       attempts++;
       if (attempts > 150) clearInterval(timer);
     }, 200);
 
-    window.addEventListener('resize', function() {
-      var frame = document.querySelector('iframe[name="frameEditor"]');
-      if (frame) {
-        var tb = document.querySelector('.editor-toolbar');
-        var h = tb ? tb.offsetHeight : 48;
-        frame.style.setProperty('height', (window.innerHeight - h) + 'px', 'important');
-      }
-    });
+    window.addEventListener('resize', applyFrameHeight);
   } catch (e) {
     document.getElementById('docTitle').textContent = 'Ошибка загрузки: ' + e.message;
   }
@@ -120,7 +146,12 @@ function signDoc() {
   }
   RbSignLocal.showCertificateDialog(docId, function (data) {
     toast('Документ подписан: ' + ((data && data.signer) || ''));
+    setTimeout(function () { location.reload(); }, 1200);
   });
+}
+
+function downloadPdf() {
+  window.location.href = API + '/documents/' + docId + '/download-pdf';
 }
 
 async function verifyDoc() {
