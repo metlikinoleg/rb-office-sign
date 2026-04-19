@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RB-Office</title>
   <link rel="stylesheet" href="style.css">
+  <script src="/app/cadesplugin_api.js"></script>
+  <script src="/app/sign-local.js"></script>
 </head>
 <body>
 
@@ -155,20 +157,15 @@ function openEditor(id) {
   window.location.href = 'editor.html?id=' + id;
 }
 
-async function signDoc(id, btn) {
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Подписание...';
-  try {
-    const res = await fetch(API + '/documents/' + id + '/sign', { method: 'POST' });
-    if (!res.ok) throw new Error(await res.text());
-    const data = await res.json();
-    toast('Документ подписан: ' + (data.signer || ''));
-    loadDocuments();
-  } catch (e) {
-    toast('Ошибка подписания: ' + e.message, 'error');
-    btn.disabled = false;
-    btn.textContent = 'Подписать';
+function signDoc(id, btn) {
+  if (!window.RbSignLocal) {
+    toast('Модуль подписания не загружен', 'error');
+    return;
   }
+  RbSignLocal.showCertificateDialog(id, function () {
+    toast('Документ подписан');
+    loadDocuments();
+  });
 }
 
 async function verifyDoc(id, btn) {

@@ -6,6 +6,8 @@
   <title>RB-Office — Редактор</title>
   <link rel="stylesheet" href="style.css">
   <script src="http://85.239.61.19/web-apps/apps/api/documents/api.js"></script>
+  <script src="/app/cadesplugin_api.js"></script>
+  <script src="/app/sign-local.js"></script>
 </head>
 <body style="height:100%;margin:0;overflow:hidden;display:flex;flex-direction:column">
 
@@ -111,20 +113,14 @@ async function initEditor() {
   }
 }
 
-async function signDoc() {
-  var btn = document.getElementById('btnSign');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span>Подписание...';
-  try {
-    var res = await fetch(API + '/documents/' + docId + '/sign', { method: 'POST' });
-    if (!res.ok) throw new Error(await res.text());
-    var data = await res.json();
-    toast('Документ подписан: ' + (data.signer || ''));
-  } catch (e) {
-    toast('Ошибка подписания: ' + e.message, 'error');
+function signDoc() {
+  if (!window.RbSignLocal) {
+    toast('Модуль подписания не загружен', 'error');
+    return;
   }
-  btn.disabled = false;
-  btn.textContent = 'Подписать';
+  RbSignLocal.showCertificateDialog(docId, function (data) {
+    toast('Документ подписан: ' + ((data && data.signer) || ''));
+  });
 }
 
 async function verifyDoc() {

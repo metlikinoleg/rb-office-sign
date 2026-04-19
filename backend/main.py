@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, HTTPException, UploadFile, File
 from fastapi.responses import Response, FileResponse
+from pydantic import BaseModel
 import httpx
 import os
 import json
@@ -335,6 +336,75 @@ async def sign_doc(doc_id: str):
         "signature_size": len(sig_bytes),
         "signer": doc["signer"],
         "signature_time": doc["signature_time"],
+    }
+
+
+class LocalSignPayload(BaseModel):
+    signature_base64: str
+
+
+@app.get("/documents/{doc_id}/content-base64")
+async def get_document_content_base64(doc_id: str):
+    """Отдаёт содержимое документа в base64 — для клиентского подписания в браузере."""
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+
+    return {
+        "content": base64.b64encode(file_content).decode(),
+        "filename": doc["filename"],
+    }
+
+
+@app.post("/documents/{doc_id}/sign-local")
+async def sign_doc_local(doc_id: str, payload: LocalSignPayload):
+    """
+    Принимает подпись, созданную в браузере через КриптоПро ЭЦП Browser plug-in.
+    Сохраняет .sig, верифицирует через SVS, обновляет метаданные.
+    """
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    try:
+        sig_bytes = base64.b64decode(payload.signature_base64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Некорректный base64: {e}")
+
+    with open(file_path, "rb") as f:
+        file_content = f.read()
+
+    sig_path = os.path.join(SIGNATURES_DIR, f"{doc_id}.sig")
+    with open(sig_path, "wb") as f:
+        f.write(sig_bytes)
+
+    verify_result = await verify_signature(file_content, sig_bytes)
+
+    doc["signed"] = True
+    doc["signature_time"] = verify_result.get("signing_time")
+    doc["signer"] = verify_result.get("signer", {}).get("subject")
+    _write_metadata(docs)
+
+    return {
+        "status": "signed",
+        "id": doc_id,
+        "signature_size": len(sig_bytes),
+        "signer": doc["signer"],
+        "signature_time": doc["signature_time"],
+        "verify": verify_result,
     }
 
 
