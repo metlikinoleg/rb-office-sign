@@ -24,9 +24,11 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas as pdf_canvas
 from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
 from reportlab.platypus.flowables import Flowable
-from pypdf import PdfReader, PdfWriter
+from pypdf import PdfReader, PdfWriter, Transformation
+import pdfplumber
 
 import re
 
@@ -617,8 +619,8 @@ class _StatusBadge(Flowable):
         c.drawString(2.2 * mm, self.h / 2 - 2.3, "✓ " + self.text)
 
 
-def _build_signature_stamp_pdf(doc: dict) -> bytes:
-    """Табличная страница-штамп в стиле rb-office.ru."""
+def _build_stamp_flowables(doc: dict, avail_w: float) -> list:
+    """Возвращает список flowables штампа (шапка + таблица подписей) на заданную ширину."""
     _register_fonts()
 
     registered = pdfmetrics.getRegisteredFontNames()
@@ -678,11 +680,6 @@ def _build_signature_stamp_pdf(doc: dict) -> bytes:
         "smute", fontName=font_regular, fontSize=8,
         textColor=HexColor("#5F5E5A"), leading=10,
     )
-
-    # ── Геометрия страницы ──────────────────────────────────────────
-    page_w, _page_h = A4
-    margin = 15 * mm
-    avail_w = page_w - 2 * margin
 
     # ── Шапка: лого + текст ─────────────────────────────────────────
     doc_id_text = doc.get("id") or ""
@@ -784,7 +781,24 @@ def _build_signature_stamp_pdf(doc: dict) -> bytes:
         ("LINEBELOW", (0, -1), (-1, -1), 0.5, HexColor("#D3D1C7")),
     ]))
 
-    # ── Сборка документа ───────────────────────────────────────────
+    return [header_table, Spacer(1, 4 * mm), sig_table]
+
+
+def _measure_flowables_height(flowables: list, avail_w: float) -> float:
+    """Суммарная высота списка flowables при отрисовке на ширине avail_w (в точках)."""
+    huge = 10_000 * mm
+    total = 0.0
+    for f in flowables:
+        _w, h = f.wrap(avail_w, huge)
+        total += h
+    return total
+
+
+def _build_stamp_standalone(doc: dict) -> bytes:
+    """A4-страница штампа с полями 15 мм — используется когда штамп не влезает на последнюю страницу документа."""
+    margin = 15 * mm
+    avail_w = A4[0] - 2 * margin
+    flowables = _build_stamp_flowables(doc, avail_w)
     buf = io.BytesIO()
     pdf_doc = SimpleDocTemplate(
         buf, pagesize=A4,
@@ -792,8 +806,52 @@ def _build_signature_stamp_pdf(doc: dict) -> bytes:
         topMargin=margin, bottomMargin=margin,
         title="RB-Office: штамп подписи",
     )
-    pdf_doc.build([header_table, Spacer(1, 4 * mm), sig_table])
+    pdf_doc.build(flowables)
     return buf.getvalue()
+
+
+def _build_stamp_overlay(doc: dict, avail_w: float) -> tuple:
+    """
+    PDF-страница размера (avail_w, высота-под-штамп) без полей — для оверлея
+    на последнюю страницу документа. Возвращает (pdf_bytes, stamp_height_pt).
+    """
+    flowables = _build_stamp_flowables(doc, avail_w)
+    stamp_h = _measure_flowables_height(flowables, avail_w)
+    page_w = avail_w
+    page_h = stamp_h
+
+    buf = io.BytesIO()
+    c = pdf_canvas.Canvas(buf, pagesize=(page_w, page_h))
+    y = page_h
+    for f in flowables:
+        _w, h = f.wrap(avail_w, page_h)
+        y -= h
+        f.drawOn(c, 0, y)
+    c.showPage()
+    c.save()
+    return buf.getvalue(), stamp_h
+
+
+def _find_last_page_content_bottom_y(pdf_bytes: bytes) -> float:
+    """
+    Возвращает Y-координату нижнего края контента последней страницы в точках,
+    отсчитывая от низа страницы (PDF-координаты снизу вверх).
+    Если страница пустая — возвращает page.height (весь низ свободен).
+    При ошибке парсинга — 0 (считаем что места нет, запасной вариант).
+    """
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page = pdf.pages[-1]
+            page_h = float(page.height)
+            chars = page.chars or []
+            if not chars:
+                return page_h
+            # pdfplumber: 'bottom' — Y от верха страницы (top-down); переводим в PDF (bottom-up).
+            max_bottom_td = max(c["bottom"] for c in chars)
+            return page_h - max_bottom_td
+    except Exception as e:
+        logger.warning("[download-pdf] pdfplumber failed: %s — fallback to standalone stamp page", e)
+        return 0.0
 
 
 async def _convert_to_pdf(doc_id: str, filename: str, ext: str) -> bytes:
@@ -893,16 +951,52 @@ async def download_pdf(doc_id: str):
         orig_pdf_bytes = await _convert_to_pdf(doc_id, doc["filename"], ext)
         logger.info("[download-pdf] converted: %d bytes", len(orig_pdf_bytes))
 
-        stamp_pdf_bytes = _build_signature_stamp_pdf(doc)
-        logger.info("[download-pdf] stamp generated: %d bytes", len(stamp_pdf_bytes))
+        content_reader = PdfReader(io.BytesIO(orig_pdf_bytes))
+        last_page = content_reader.pages[-1]
+        page_w_pt = float(last_page.mediabox.width)
+        page_h_pt = float(last_page.mediabox.height)
+
+        margin_pt = 15 * mm
+        gap_pt = 5 * mm
+        side_avail_w = page_w_pt - 2 * margin_pt
+
+        overlay_bytes, stamp_h_pt = _build_stamp_overlay(doc, side_avail_w)
+        content_bottom_y = _find_last_page_content_bottom_y(orig_pdf_bytes)
+        needed = stamp_h_pt + gap_pt + margin_pt
+        fits = content_bottom_y >= needed
+        logger.info(
+            "[download-pdf] last-page geometry: width=%.1fpt height=%.1fpt content_bottom_y=%.1fpt needed=%.1fpt fits=%s",
+            page_w_pt, page_h_pt, content_bottom_y, needed, fits,
+        )
 
         writer = PdfWriter()
-        writer.append(fileobj=io.BytesIO(orig_pdf_bytes))
-        writer.append(fileobj=io.BytesIO(stamp_pdf_bytes))
+
+        if fits:
+            # Оверлеим штамп на последнюю страницу: низ штампа на margin_pt от низа.
+            stamp_reader = PdfReader(io.BytesIO(overlay_bytes))
+            stamp_page = stamp_reader.pages[0]
+            tx = margin_pt
+            ty = margin_pt
+            last_page.merge_transformed_page(
+                stamp_page, Transformation().translate(tx=tx, ty=ty)
+            )
+            for page in content_reader.pages:
+                writer.add_page(page)
+            logger.info("[download-pdf] stamp embedded on last page at ty=%.1fpt", ty)
+        else:
+            # Не влезло — добавляем отдельной A4-страницей.
+            for page in content_reader.pages:
+                writer.add_page(page)
+            standalone_bytes = _build_stamp_standalone(doc)
+            standalone_reader = PdfReader(io.BytesIO(standalone_bytes))
+            for page in standalone_reader.pages:
+                writer.add_page(page)
+            logger.info("[download-pdf] stamp appended as new page")
+
         out = io.BytesIO()
         writer.write(out)
         out.seek(0)
-        logger.info("[download-pdf] merged: %d bytes", len(out.getvalue()))
+        logger.info("[download-pdf] final size: %d bytes", len(out.getvalue()))
     except HTTPException:
         raise
     except Exception as e:
