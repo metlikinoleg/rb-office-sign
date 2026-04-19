@@ -30,6 +30,12 @@ from reportlab.platypus.flowables import Flowable
 from pypdf import PdfReader, PdfWriter, Transformation
 import pdfplumber
 
+from docx import Document as DocxDocument
+from docx.shared import Pt, Mm, RGBColor
+from docx.enum.table import WD_ALIGN_VERTICAL
+from docx.oxml.ns import qn
+from docx.oxml import OxmlElement
+
 import re
 
 load_dotenv()
@@ -854,6 +860,188 @@ def _find_last_page_content_bottom_y(pdf_bytes: bytes) -> float:
         return 0.0
 
 
+# ── DOCX stamp helpers ────────────────────────────────────────────
+
+def _shade_cell(cell, hex_color: str):
+    """Заливка ячейки через <w:shd> в tcPr."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    tc_pr.append(shd)
+
+
+def _shade_run(run, hex_color: str):
+    """Фон под буквами — <w:shd> в rPr (highlighting на уровне run)."""
+    r_pr = run._r.get_or_add_rPr()
+    shd = OxmlElement("w:shd")
+    shd.set(qn("w:val"), "clear")
+    shd.set(qn("w:color"), "auto")
+    shd.set(qn("w:fill"), hex_color)
+    r_pr.append(shd)
+
+
+def _set_table_borders(table, size: int, color: str):
+    """Единый тонкий border по всем рёбрам таблицы. size в восьмых пункта (4 = 0.5pt)."""
+    tbl_pr = table._tbl.tblPr
+    tbl_borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        b = OxmlElement(f"w:{edge}")
+        b.set(qn("w:val"), "single")
+        b.set(qn("w:sz"), str(size))
+        b.set(qn("w:space"), "0")
+        b.set(qn("w:color"), color)
+        tbl_borders.append(b)
+    tbl_pr.append(tbl_borders)
+
+
+def _set_cell_width(cell, width_mm: float):
+    """Жёстко фиксирует ширину ячейки через <w:tcW> (autofit сам по себе не держит)."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    tcW = tc_pr.find(qn("w:tcW"))
+    if tcW is None:
+        tcW = OxmlElement("w:tcW")
+        tc_pr.append(tcW)
+    # 1 mm ≈ 56.69 twentieths of a point (twip); используем dxa (twips)
+    tcW.set(qn("w:w"), str(int(width_mm * 56.7)))
+    tcW.set(qn("w:type"), "dxa")
+
+
+def _add_signature_stamp_to_docx(docx_bytes: bytes, doc_meta: dict) -> bytes:
+    """
+    Дорисовывает в конец DOCX заголовок «Документ подписан через RB-Office»,
+    строку с идентификатором и таблицу подписей в стиле PDF-штампа.
+    """
+    doc = DocxDocument(io.BytesIO(docx_bytes))
+
+    signer_info = doc_meta.get("signer_info") or {}
+    subject_raw = signer_info.get("subject") or doc_meta.get("signer") or ""
+    subject_fields = _parse_subject(subject_raw)
+    org_name = subject_fields.get("O", "").strip()
+    position = subject_fields.get("T", "").strip()
+    surname = subject_fields.get("SN", "").strip()
+    given_name = subject_fields.get("G", "").strip()
+    full_name = f"{surname} {given_name}".strip()
+    cn = _extract_cn(subject_raw)
+    is_valid = bool(doc_meta.get("signature_valid", True))
+
+    # Отступ от контента
+    doc.add_paragraph()
+
+    # Заголовок
+    p_header = doc.add_paragraph()
+    run_h = p_header.add_run("Документ подписан через RB-Office")
+    run_h.font.size = Pt(11)
+    run_h.font.bold = True
+    run_h.font.color.rgb = RGBColor(0x04, 0x2C, 0x53)
+
+    # ID
+    p_id = doc.add_paragraph()
+    run_id = p_id.add_run(f"Идентификатор {doc_meta.get('id') or ''}")
+    run_id.font.size = Pt(8)
+    run_id.font.color.rgb = RGBColor(0x5F, 0x5E, 0x5A)
+
+    # Таблица: 5 колонок × 2 строки
+    table = doc.add_table(rows=2, cols=5)
+    table.autofit = False
+    widths_mm = [20, 48, 30, 38, 34]  # сумма 170 — ширина текста A4 за вычетом полей 2×20 мм
+
+    headers = ["РОЛЬ", "ОРГАНИЗАЦИЯ / СОТРУДНИК", "ДОВЕРЕННОСТЬ", "СЕРТИФИКАТ", "ДАТА ПОДПИСАНИЯ"]
+    header_row = table.rows[0]
+    for i, h in enumerate(headers):
+        cell = header_row.cells[i]
+        _set_cell_width(cell, widths_mm[i])
+        _shade_cell(cell, "F1EFE8")
+        p = cell.paragraphs[0]
+        p.paragraph_format.space_before = Pt(0)
+        p.paragraph_format.space_after = Pt(0)
+        r = p.add_run(h)
+        r.font.size = Pt(7.5)
+        r.font.bold = True
+        r.font.color.rgb = RGBColor(0x5F, 0x5E, 0x5A)
+
+    data_row = table.rows[1]
+    for i in range(5):
+        _set_cell_width(data_row.cells[i], widths_mm[i])
+        data_row.cells[i].vertical_alignment = WD_ALIGN_VERTICAL.TOP
+
+    # РОЛЬ
+    cell_role = data_row.cells[0]
+    r = cell_role.paragraphs[0].add_run("Отправитель")
+    r.font.size = Pt(9)
+    r.font.bold = True
+    r.font.color.rgb = RGBColor(0x0C, 0x44, 0x7C)
+
+    # ОРГ / СОТРУДНИК — до трёх строк
+    cell_org = data_row.cells[1]
+    cell_org.paragraphs[0].text = ""
+    first_p = cell_org.paragraphs[0]
+    if org_name:
+        r1 = first_p.add_run(org_name)
+        r1.font.size = Pt(9)
+        r1.font.bold = True
+    if position:
+        p2 = first_p if not org_name else cell_org.add_paragraph()
+        r2 = p2.add_run(position)
+        r2.font.size = Pt(8)
+        r2.font.color.rgb = RGBColor(0x5F, 0x5E, 0x5A)
+    if full_name:
+        p3 = first_p if not (org_name or position) else cell_org.add_paragraph()
+        r3 = p3.add_run(full_name)
+        r3.font.size = Pt(9)
+    if not (org_name or position or full_name):
+        rfb = first_p.add_run(cn or "—")
+        rfb.font.size = Pt(9)
+        rfb.font.bold = True
+
+    # ДОВЕРЕННОСТЬ
+    cell_proxy = data_row.cells[2]
+    r = cell_proxy.paragraphs[0].add_run("Не требуется")
+    r.font.size = Pt(9)
+    r.font.color.rgb = RGBColor(0x5F, 0x5E, 0x5A)
+
+    # СЕРТИФИКАТ
+    cell_cert = data_row.cells[3]
+    cell_cert.paragraphs[0].text = ""
+    p_serial = cell_cert.paragraphs[0]
+    r_serial = p_serial.add_run(signer_info.get("serial") or "—")
+    r_serial.font.size = Pt(7)
+    r_serial.font.name = "Consolas"
+    valid_range = (
+        f"{_fmt_date_short(signer_info.get('valid_from')) or '—'} — "
+        f"{_fmt_date_short(signer_info.get('valid_to')) or '—'}"
+    )
+    p_valid = cell_cert.add_paragraph()
+    r_valid = p_valid.add_run(valid_range)
+    r_valid.font.size = Pt(8)
+    r_valid.font.color.rgb = RGBColor(0x5F, 0x5E, 0x5A)
+
+    # ДАТА + бейдж
+    cell_date = data_row.cells[4]
+    cell_date.paragraphs[0].text = ""
+    p_dt = cell_date.paragraphs[0]
+    r_dt = p_dt.add_run(_fmt_sign_time(doc_meta.get("signature_time")) or "—")
+    r_dt.font.size = Pt(9)
+    p_badge = cell_date.add_paragraph()
+    badge_text = " ✓ Подпись верна " if is_valid else " ✗ Подпись неверна "
+    r_badge = p_badge.add_run(badge_text)
+    r_badge.font.size = Pt(7)
+    r_badge.font.bold = True
+    if is_valid:
+        r_badge.font.color.rgb = RGBColor(0x27, 0x50, 0x0A)
+        _shade_run(r_badge, "EAF3DE")
+    else:
+        r_badge.font.color.rgb = RGBColor(0x7A, 0x1A, 0x1A)
+        _shade_run(r_badge, "F7DCDC")
+
+    _set_table_borders(table, size=4, color="D3D1C7")
+
+    out = io.BytesIO()
+    doc.save(out)
+    return out.getvalue()
+
+
 async def _convert_to_pdf(doc_id: str, filename: str, ext: str) -> bytes:
     """Запрашивает у OnlyOffice ConvertService конвертацию документа в PDF."""
     convert_key = f"{doc_id}_pdf_{int(datetime.now(timezone.utc).timestamp())}"
@@ -1013,6 +1201,54 @@ async def download_pdf(doc_id: str):
     return StreamingResponse(
         out,
         media_type="application/pdf",
+        headers={"Content-Disposition": disposition},
+    )
+
+
+@app.get("/documents/{doc_id}/download-docx-signed")
+async def download_docx_signed(doc_id: str):
+    """Скачивает исходный .docx с дорисованным в конце штампом подписи."""
+    logger.info("[download-docx-signed] start doc_id=%s", doc_id)
+
+    docs = _read_metadata()
+    doc = _find_doc(docs, doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Документ не найден")
+    if not doc.get("signed"):
+        raise HTTPException(status_code=400, detail="Документ не подписан")
+
+    filename = doc.get("filename") or ""
+    ext = os.path.splitext(filename)[1].lstrip(".").lower()
+    if ext != "docx":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Вставка штампа в DOCX доступна только для .docx файлов (этот файл .{ext})",
+        )
+
+    file_path = os.path.join(DOCUMENTS_DIR, doc["stored_name"])
+    if not os.path.isfile(file_path):
+        raise HTTPException(status_code=404, detail="Файл не найден на диске")
+
+    try:
+        with open(file_path, "rb") as f:
+            original_bytes = f.read()
+        stamped_bytes = _add_signature_stamp_to_docx(original_bytes, doc)
+        logger.info(
+            "[download-docx-signed] stamped: original=%d bytes, out=%d bytes",
+            len(original_bytes), len(stamped_bytes),
+        )
+    except Exception as e:
+        logger.exception("[download-docx-signed] failed for doc_id=%s: %s", doc_id, e)
+        raise HTTPException(status_code=500, detail=f"Ошибка генерации DOCX со штампом: {e}")
+
+    base_name = os.path.splitext(filename)[0]
+    out_name = f"{base_name}_signed.docx"
+    ascii_name = _ascii_fallback(out_name)
+    disposition = f"attachment; filename=\"{ascii_name}\"; filename*=UTF-8''{quote(out_name)}"
+
+    return StreamingResponse(
+        io.BytesIO(stamped_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         headers={"Content-Disposition": disposition},
     )
 
