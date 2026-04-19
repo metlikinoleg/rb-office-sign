@@ -19,11 +19,16 @@ logging.basicConfig(level=logging.INFO)
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
+from reportlab.lib import colors
 from reportlab.lib.colors import HexColor
+from reportlab.lib.styles import ParagraphStyle
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
-from reportlab.pdfgen import canvas as pdf_canvas
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+from reportlab.platypus.flowables import Flowable
 from pypdf import PdfReader, PdfWriter
+
+import re
 
 load_dotenv()
 
@@ -39,6 +44,7 @@ DOCUMENTS_DIR = os.getenv("DOCUMENTS_DIR", "./documents")
 # Шрифт с поддержкой кириллицы — устанавливается через пакет fonts-dejavu-core
 DEJAVU_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 DEJAVU_BOLD_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+DEJAVU_MONO_PATH = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
 _font_registered = False
 
 
@@ -50,6 +56,8 @@ def _register_fonts():
         pdfmetrics.registerFont(TTFont("DejaVu", DEJAVU_PATH))
     if os.path.isfile(DEJAVU_BOLD_PATH):
         pdfmetrics.registerFont(TTFont("DejaVu-Bold", DEJAVU_BOLD_PATH))
+    if os.path.isfile(DEJAVU_MONO_PATH):
+        pdfmetrics.registerFont(TTFont("DejaVu-Mono", DEJAVU_MONO_PATH))
     _font_registered = True
 
 os.makedirs(SIGNATURES_DIR, exist_ok=True)
@@ -460,89 +468,260 @@ async def sign_doc_local(doc_id: str, payload: LocalSignPayload):
     }
 
 
+class _LogoCircle(Flowable):
+    """Круг 9мм с белыми буквами «РБ» — логотип RB-Office в шапке штампа."""
+
+    def __init__(self, size: float = 9 * mm, fill: str = "#042C53", text_color: str = "#E6F1FB"):
+        Flowable.__init__(self)
+        self.size = size
+        self.fill = fill
+        self.text_color = text_color
+
+    def wrap(self, _w, _h):
+        return self.size, self.size
+
+    def draw(self):
+        c = self.canv
+        r = self.size / 2
+        c.setFillColor(HexColor(self.fill))
+        c.circle(r, r, r, fill=1, stroke=0)
+        c.setFillColor(HexColor(self.text_color))
+        c.setFont("DejaVu-Bold", 10)
+        # вертикально центрируем: ascender ~= 0.75 * fontSize
+        c.drawCentredString(r, r - 3.1, "РБ")
+
+
+def _extract_cn(subject: str) -> str:
+    """Достаёт значение CN= из subject в стиле RFC 2253 / openssl."""
+    if not subject:
+        return ""
+    m = re.search(r"(?:^|,\s*|/)CN=([^,/]+)", subject)
+    return (m.group(1).strip() if m else subject).strip()
+
+
+def _fmt_date_short(value: str) -> str:
+    """Пытается привести произвольное представление даты к DD.MM.YYYY."""
+    if not value:
+        return ""
+    s = str(value).strip()
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).strftime("%d.%m.%Y")
+    except Exception:
+        pass
+    m = re.search(r"(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", s)
+    if m:
+        d, mo, y = m.group(1), m.group(2), m.group(3)
+        if len(y) == 2:
+            y = "20" + y
+        return f"{int(d):02d}.{int(mo):02d}.{y}"
+    return s
+
+
+def _fmt_sign_time(value: str) -> str:
+    """«DD.MM.YYYY, HH:MM». Источники: ISO 8601 или «HH:MM DD.MM.YYYY (…)»."""
+    if not value:
+        return ""
+    s = str(value).strip()
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%Y, %H:%M")
+    except Exception:
+        pass
+    m = re.search(r"(\d{1,2}):(\d{2})\s+(\d{1,2})[.\-/](\d{1,2})[.\-/](\d{2,4})", s)
+    if m:
+        h, mi, d, mo, y = m.groups()
+        if len(y) == 2:
+            y = "20" + y
+        return f"{int(d):02d}.{int(mo):02d}.{y}, {int(h):02d}:{int(mi):02d}"
+    return s
+
+
+class _StatusBadge(Flowable):
+    """Зелёный бейдж «✓ Подпись верна» с закруглёнными углами."""
+
+    def __init__(
+        self,
+        text: str = "Подпись верна",
+        fill: str = "#EAF3DE",
+        text_color: str = "#27500A",
+        width: float = 33 * mm,
+        height: float = 5.5 * mm,
+    ):
+        Flowable.__init__(self)
+        self.text = text
+        self.fill = fill
+        self.text_color = text_color
+        self.w = width
+        self.h = height
+
+    def wrap(self, _aw, _ah):
+        return self.w, self.h
+
+    def draw(self):
+        c = self.canv
+        c.setFillColor(HexColor(self.fill))
+        c.setStrokeColor(HexColor(self.fill))
+        c.roundRect(0, 0, self.w, self.h, 1.8 * mm, fill=1, stroke=0)
+        c.setFillColor(HexColor(self.text_color))
+        c.setFont("DejaVu-Bold", 7)
+        c.drawString(2.2 * mm, self.h / 2 - 2.3, "✓ " + self.text)
+
+
 def _build_signature_stamp_pdf(doc: dict) -> bytes:
-    """Рендерит A4-страницу-штамп с данными подписи. Кириллица через DejaVuSans."""
+    """Табличная страница-штамп в стиле rb-office.ru."""
     _register_fonts()
+
+    registered = pdfmetrics.getRegisteredFontNames()
+    font_regular = "DejaVu" if "DejaVu" in registered else "Helvetica"
+    font_bold = "DejaVu-Bold" if "DejaVu-Bold" in registered else "Helvetica-Bold"
+    font_mono = "DejaVu-Mono" if "DejaVu-Mono" in registered else "Courier"
 
     signer_info = doc.get("signer_info") or {}
     is_valid = bool(doc.get("signature_valid", True))
+    subject_raw = signer_info.get("subject") or doc.get("signer") or ""
+    cn = _extract_cn(subject_raw) or subject_raw or "—"
 
-    buf = io.BytesIO()
-    c = pdf_canvas.Canvas(buf, pagesize=A4)
-    width, height = A4
-
-    font_regular = "DejaVu" if "DejaVu" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
-    font_bold = "DejaVu-Bold" if "DejaVu-Bold" in pdfmetrics.getRegisteredFontNames() else "Helvetica-Bold"
-
-    left = 20 * mm
-    right = width - 20 * mm
-    y = height - 30 * mm
-
-    # Заголовок
-    c.setFont(font_bold, 18)
-    c.drawString(left, y, "ЭЛЕКТРОННАЯ ПОДПИСЬ")
-    y -= 6 * mm
-    c.setStrokeColor(HexColor("#cccccc"))
-    c.setLineWidth(0.8)
-    c.line(left, y, right, y)
-    y -= 10 * mm
-
-    def draw_field(label: str, value: str):
-        nonlocal y
-        if y < 30 * mm:
-            return
-        c.setFont(font_bold, 10)
-        c.setFillColor(HexColor("#444444"))
-        c.drawString(left, y, label)
-        y -= 5 * mm
-        c.setFont(font_regular, 11)
-        c.setFillColor(HexColor("#000000"))
-        text = value or "—"
-        max_width = right - left
-        line = ""
-        for word in str(text).split():
-            probe = (line + " " + word).strip()
-            if c.stringWidth(probe, font_regular, 11) > max_width and line:
-                c.drawString(left, y, line)
-                y -= 5 * mm
-                line = word
-            else:
-                line = probe
-        if line:
-            c.drawString(left, y, line)
-            y -= 8 * mm
-
-    def fmt_range(a, b):
-        a = a or "—"
-        b = b or "—"
-        return f"{a}  —  {b}"
-
-    draw_field("Документ:", doc.get("filename") or "")
-    draw_field("Подписант (CN):", signer_info.get("subject") or doc.get("signer") or "")
-    draw_field("Издатель:", signer_info.get("issuer") or "")
-    draw_field("Отпечаток сертификата:", signer_info.get("thumbprint") or "")
-    draw_field("Серийный номер:", signer_info.get("serial") or "")
-    draw_field(
-        "Срок действия сертификата:",
-        fmt_range(signer_info.get("valid_from"), signer_info.get("valid_to")),
+    # ── Стили абзацев для ячеек ─────────────────────────────────────
+    st_header_title = ParagraphStyle(
+        "h_title", fontName=font_regular, fontSize=11,
+        textColor=HexColor("#1A1A1A"), leading=13,
     )
-    draw_field("Время подписания:", doc.get("signature_time") or "")
-    draw_field("Тип подписи:", doc.get("signature_type") or "CAdES-BES")
+    st_header_sub = ParagraphStyle(
+        "h_sub", fontName=font_regular, fontSize=8,
+        textColor=HexColor("#5F5E5A"), leading=10,
+    )
+    st_col_header = ParagraphStyle(
+        "col_h", fontName=font_regular, fontSize=8,
+        textColor=HexColor("#5F5E5A"), leading=10,
+    )
+    st_role = ParagraphStyle(
+        "role", fontName=font_bold, fontSize=9,
+        textColor=HexColor("#0C447C"), leading=11,
+    )
+    st_org = ParagraphStyle(
+        "org", fontName=font_bold, fontSize=9,
+        textColor=HexColor("#1A1A1A"), leading=11,
+    )
+    st_org_sub = ParagraphStyle(
+        "org_sub", fontName=font_regular, fontSize=8,
+        textColor=HexColor("#5F5E5A"), leading=10,
+    )
+    st_cell = ParagraphStyle(
+        "cell", fontName=font_regular, fontSize=9,
+        textColor=HexColor("#1A1A1A"), leading=11,
+    )
+    st_mute = ParagraphStyle(
+        "mute", fontName=font_regular, fontSize=9,
+        textColor=HexColor("#5F5E5A"), leading=11,
+    )
+    st_mono = ParagraphStyle(
+        "mono", fontName=font_mono, fontSize=7,
+        textColor=HexColor("#1A1A1A"), leading=9,
+    )
+    st_small_mute = ParagraphStyle(
+        "smute", fontName=font_regular, fontSize=8,
+        textColor=HexColor("#5F5E5A"), leading=10,
+    )
 
-    # Статус
-    y -= 4 * mm
-    if is_valid:
-        status_text = "ПОДПИСЬ ДЕЙСТВИТЕЛЬНА"
-        color = HexColor("#1a7f2e")
-    else:
-        status_text = "ПОДПИСЬ НЕ ДЕЙСТВИТЕЛЬНА"
-        color = HexColor("#c0222e")
-    c.setFont(font_bold, 14)
-    c.setFillColor(color)
-    c.drawString(left, y, status_text)
+    # ── Геометрия страницы ──────────────────────────────────────────
+    page_w, _page_h = A4
+    margin = 15 * mm
+    avail_w = page_w - 2 * margin
 
-    c.showPage()
-    c.save()
+    # ── Шапка: лого + текст ─────────────────────────────────────────
+    doc_id_text = doc.get("id") or ""
+    header_right = [
+        Paragraph("Документ подписан через RB-Office", st_header_title),
+        Spacer(1, 1 * mm),
+        Paragraph(f"Идентификатор {doc_id_text}", st_header_sub),
+    ]
+    header_table = Table(
+        [[_LogoCircle(9 * mm), header_right]],
+        colWidths=[12 * mm, avail_w - 12 * mm],
+    )
+    header_table.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("LINEBELOW", (0, 0), (-1, -1), 0.5, HexColor("#D3D1C7")),
+    ]))
+
+    # ── Таблица подписей ───────────────────────────────────────────
+    # Доли: РОЛЬ 12% / ОРГ 28% / ДОВЕРЕННОСТЬ 18% / СЕРТИФИКАТ 22% / ДАТА 20%
+    col_widths = [avail_w * p for p in (0.12, 0.28, 0.18, 0.22, 0.20)]
+
+    header_cells = [
+        Paragraph("РОЛЬ", st_col_header),
+        Paragraph("ОРГАНИЗАЦИЯ / СОТРУДНИК", st_col_header),
+        Paragraph("ДОВЕРЕННОСТЬ", st_col_header),
+        Paragraph("СЕРТИФИКАТ", st_col_header),
+        Paragraph("ДАТА ПОДПИСАНИЯ", st_col_header),
+    ]
+
+    serial = signer_info.get("serial") or "—"
+    valid_range = f"{_fmt_date_short(signer_info.get('valid_from')) or '—'} — {_fmt_date_short(signer_info.get('valid_to')) or '—'}"
+    sign_time_str = _fmt_sign_time(doc.get("signature_time"))
+
+    cert_cell = [
+        Paragraph(serial, st_mono),
+        Spacer(1, 1.5 * mm),
+        Paragraph(valid_range, st_small_mute),
+    ]
+
+    date_cell = [
+        Paragraph(sign_time_str or "—", st_cell),
+        Spacer(1, 1.5 * mm),
+        _StatusBadge("Подпись верна" if is_valid else "Подпись неверна",
+                     fill="#EAF3DE" if is_valid else "#F7DCDC",
+                     text_color="#27500A" if is_valid else "#7A1A1A"),
+    ]
+
+    org_cell = [Paragraph(cn, st_org)]
+    if subject_raw and subject_raw != cn:
+        org_cell += [Spacer(1, 1 * mm), Paragraph(subject_raw, st_org_sub)]
+
+    signer_row = [
+        Paragraph("Отправитель", st_role),
+        org_cell,
+        Paragraph("Не требуется", st_mute),
+        cert_cell,
+        date_cell,
+    ]
+
+    sig_table = Table(
+        [header_cells, signer_row],
+        colWidths=col_widths,
+        repeatRows=1,
+    )
+    sig_table.setStyle(TableStyle([
+        # Шапка колонок
+        ("BACKGROUND", (0, 0), (-1, 0), HexColor("#F1EFE8")),
+        ("TOPPADDING", (0, 0), (-1, 0), 2.5 * mm),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 2.5 * mm),
+        ("LEFTPADDING", (0, 0), (-1, 0), 3 * mm),
+        ("RIGHTPADDING", (0, 0), (-1, 0), 3 * mm),
+        # Строки данных
+        ("VALIGN", (0, 1), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 1), (-1, -1), 4 * mm),
+        ("BOTTOMPADDING", (0, 1), (-1, -1), 4 * mm),
+        ("LEFTPADDING", (0, 1), (-1, -1), 3 * mm),
+        ("RIGHTPADDING", (0, 1), (-1, -1), 3 * mm),
+        # Разделитель над строкой подписи
+        ("LINEABOVE", (0, 1), (-1, 1), 0.5, HexColor("#D3D1C7")),
+        ("LINEBELOW", (0, -1), (-1, -1), 0.5, HexColor("#D3D1C7")),
+    ]))
+
+    # ── Сборка документа ───────────────────────────────────────────
+    buf = io.BytesIO()
+    pdf_doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=margin, rightMargin=margin,
+        topMargin=margin, bottomMargin=margin,
+        title="RB-Office: штамп подписи",
+    )
+    pdf_doc.build([header_table, Spacer(1, 4 * mm), sig_table])
     return buf.getvalue()
 
 
