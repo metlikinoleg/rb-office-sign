@@ -130,20 +130,21 @@ function renderDocuments(docs) {
   empty.style.display = 'none';
 
   tbody.innerHTML = docs.map(doc => {
+    const id = esc(doc.id);
     const statusHtml = doc.signed
       ? '<span class="badge badge-signed">Подписан' + (doc.signer ? ' (' + esc(doc.signer) + ')' : '') + '</span>'
       : '<span class="badge badge-unsigned">Не подписан</span>';
     const actions = doc.signed
       ? `
-        <button class="btn btn-primary" onclick="openEditor('${doc.id}')">Открыть (просмотр)</button>
-        <button class="btn btn-info" onclick="verifyDoc('${doc.id}', this)">Проверить подпись</button>
-        <button class="btn btn-success" onclick="downloadPdf('${doc.id}')">Скачать PDF</button>
-        <button class="btn btn-danger" onclick="deleteDoc('${doc.id}', this)">Удалить</button>
+        <button class="btn btn-primary" data-action="open" data-doc-id="${id}">Открыть (просмотр)</button>
+        <button class="btn btn-info" data-action="verify" data-doc-id="${id}">Проверить подпись</button>
+        <button class="btn btn-success" data-action="download-pdf" data-doc-id="${id}">Скачать PDF</button>
+        <button class="btn btn-danger" data-action="delete" data-doc-id="${id}">Удалить</button>
       `
       : `
-        <button class="btn btn-primary" onclick="openEditor('${doc.id}')">Открыть</button>
-        <button class="btn btn-success" onclick="signDoc('${doc.id}', this)">Подписать</button>
-        <button class="btn btn-danger" onclick="deleteDoc('${doc.id}', this)">Удалить</button>
+        <button class="btn btn-primary" data-action="open" data-doc-id="${id}">Открыть</button>
+        <button class="btn btn-success" data-action="sign-local" data-doc-id="${id}">Подписать</button>
+        <button class="btn btn-danger" data-action="delete" data-doc-id="${id}">Удалить</button>
       `;
     return `
       <tr>
@@ -156,29 +157,40 @@ function renderDocuments(docs) {
   }).join('');
 }
 
+// Единый делегированный обработчик для всех action-кнопок в таблице.
+// Не зависит от порядка загрузки defer-скриптов и от того, когда строки
+// попали в DOM — листенер висит на document.
+document.addEventListener('click', e => {
+  const btn = e.target.closest('[data-action][data-doc-id]');
+  if (!btn) return;
+  const action = btn.dataset.action;
+  const docId = btn.dataset.docId;
+
+  if (action === 'open') {
+    window.location.href = 'editor.html?id=' + docId;
+  } else if (action === 'download-pdf') {
+    window.location.href = API + '/documents/' + docId + '/download-pdf';
+  } else if (action === 'sign-local') {
+    console.log('[index] sign-local click', docId, 'RbSignLocal=', !!window.RbSignLocal);
+    if (!window.RbSignLocal) {
+      toast('Модуль подписания не загружен (cadesplugin_api.js/sign-local.js)', 'error');
+      return;
+    }
+    window.RbSignLocal.showCertificateDialog(docId, () => {
+      toast('Документ подписан');
+      loadDocuments();
+    });
+  } else if (action === 'verify') {
+    verifyDoc(docId, btn);
+  } else if (action === 'delete') {
+    deleteDoc(docId, btn);
+  }
+});
+
 function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
-}
-
-function openEditor(id) {
-  window.location.href = 'editor.html?id=' + id;
-}
-
-function downloadPdf(id) {
-  window.location.href = API + '/documents/' + id + '/download-pdf';
-}
-
-function signDoc(id, btn) {
-  if (!window.RbSignLocal) {
-    toast('Модуль подписания не загружен', 'error');
-    return;
-  }
-  RbSignLocal.showCertificateDialog(id, function () {
-    toast('Документ подписан');
-    loadDocuments();
-  });
 }
 
 async function verifyDoc(id, btn) {

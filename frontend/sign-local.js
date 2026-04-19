@@ -175,6 +175,7 @@
   }
 
   async function showCertificateDialog(docId, onSigned) {
+    console.log('[sign-local] showCertificateDialog called for', docId);
     renderDialog('<h3>Выбор сертификата для подписи</h3><div class="sl-msg"><span class="sl-spinner"></span>Загрузка списка сертификатов…</div>');
 
     var certs;
@@ -224,4 +225,5 @@
     signDocument: signDocument,
     showCertificateDialog: showCertificateDialog,
   };
+  console.log('[sign-local] RbSignLocal registered; cadesplugin=', typeof window.cadesplugin);
 })();
